@@ -1,12 +1,12 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import time
+import numpy as np
 
-# --- 1. APP CONFIGURATION ---
-st.set_page_config(page_title="Donchian Sniper Pro", layout="wide", initial_sidebar_state="expanded")
+# --- 1. CONFIGURATION ---
+st.set_page_config(page_title="Donchian Pro", layout="wide", initial_sidebar_state="expanded")
 
-# CSS: Professional Styling & Privacy (Hides Footer/Deploy)
+# CSS: Hide Footer/Deploy, professional look
 st.markdown("""
     <style>
         #MainMenu {visibility: hidden;}
@@ -23,7 +23,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ Donchian Trend Sniper (Verified Nifty 500)")
+st.title("⚡ Donchian Trend Sniper (Pro Filters)")
 
 # --- 2. ASSET LISTS ---
 COMMODITIES = {
@@ -31,7 +31,7 @@ COMMODITIES = {
     'Crude Oil': 'CL=F', 'Natural Gas': 'NG=F', 'Aluminum': 'ALI=F'
 }
 
-# COMPLETE NIFTY 500 LIST (Verified from MW-NIFTY-500-06-Dec-2025.csv)
+# COMPLETE NIFTY 500 LIST
 NSE_500_LIST = [
     'M&MFIN.NS', 'RCF.NS', 'PATANJALI.NS', 'SBICARD.NS', 'SUNDARMFIN.NS', 'PTCIL.NS', 'INDUSTOWER.NS', 'CHOLAFIN.NS', 'LTF.NS', 'SKFINDUS.NS',
     'SHRIRAMFIN.NS', 'MARICO.NS', 'DEEPAKNTR.NS', 'ABCAPITAL.NS', 'SBIN.NS', 'PNBHOUSING.NS', 'MUTHOOTFIN.NS', 'RBLBANK.NS', 'POLICYBZR.NS', 'LLOYDSME.NS',
@@ -86,140 +86,123 @@ NSE_500_LIST = [
     'KAYNES.NS'
 ]
 
-# --- 3. DATA & STRATEGY ENGINE ---
+# --- 3. ANALYTICS ENGINE ---
+def calculate_indicators(df):
+    """Calculates Donchian (20), SMA (200) and RSI (14)"""
+    df['High_20'] = df['High'].rolling(20).max()
+    df['Low_20'] = df['Low'].rolling(20).min()
+    df['Middle'] = (df['High_20'] + df['Low_20']) / 2
+    df['SMA_200'] = df['Close'].rolling(200).mean()
+    
+    # RSI Calculation
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    return df
+
 def process_batch(tickers):
-    """Downloads batch with AUTO-ADJUST to ensure Price Accuracy"""
+    """Downloads batch with AUTO-ADJUST"""
     try:
-        # period="3mo" is enough for 20-day channels + buffers
-        data = yf.download(tickers, period="3mo", group_by='ticker', threads=True, progress=False, auto_adjust=True)
+        data = yf.download(tickers, period="1y", group_by='ticker', threads=True, progress=False, auto_adjust=True)
         return data
     except Exception:
         return None
 
-def calculate_donchian_signal(df):
-    """
-    STRICT STRATEGY LOGIC:
-    BUY: Yesterday Close < Middle AND Today Close > Middle
-    SELL: Yesterday Close > Middle AND Today Close < Middle
-    """
-    if len(df) < 22: return None, 0, None
-
-    # 1. Donchian Calculation (20 Period)
-    df['High_20'] = df['High'].rolling(window=20).max()
-    df['Low_20'] = df['Low'].rolling(window=20).min()
-    df['Middle'] = (df['High_20'] + df['Low_20']) / 2
-    
-    # 2. Extract Last Two Completed Candles
-    today = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    # 3. Apply Signal Rules
-    if prev['Close'] < prev['Middle'] and today['Close'] > today['Middle']:
-        return "BUY", today['Close'], today.name
-
-    elif prev['Close'] > prev['Middle'] and today['Close'] < today['Middle']:
-        return "SELL", today['Close'], today.name
-        
-    return None, today['Close'], today.name
-
-# --- 4. SCANNER FUNCTION ---
-@st.cache_data(ttl=600)
-def run_robust_scan(target_list):
+# --- 4. SCANNER LOGIC ---
+@st.cache_data(ttl=900)
+def run_scan(target_list, use_trend, use_rsi):
     results_buy = []
     results_sell = []
     
-    # Process in batches of 30 to prevent Data Corruption/Timeouts
     chunk_size = 30
     total_chunks = range(0, len(target_list), chunk_size)
-    
     progress = st.progress(0)
-    status_text = st.empty()
+    status = st.empty()
     
     for i, start_idx in enumerate(total_chunks):
         batch = target_list[start_idx : start_idx + chunk_size]
-        status_text.caption(f"Scanning batch {i+1}/{len(total_chunks)}...")
+        status.caption(f"Scanning batch {i+1}/{len(total_chunks)}...")
         
         data = process_batch(batch)
         if data is None or data.empty: continue
         
         for ticker in batch:
             try:
-                # Handle Multi-Index cleanly
-                if len(batch) > 1:
-                    df = data[ticker].copy()
-                else:
-                    df = data.copy()
+                df = data[ticker] if len(batch) > 1 else data.copy()
+                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                df = df.dropna()
+                if len(df) < 50: continue
                 
-                df.dropna(inplace=True)
-                if df.empty: continue
+                df = calculate_indicators(df)
+                today = df.iloc[-1]
+                prev = df.iloc[-2]
                 
-                signal, price, date = calculate_donchian_signal(df)
-                
-                # CLEAN DISPLAY NAME (Remove .NS and =F)
+                # Format Name
                 display_name = ticker.replace('.NS', '').replace('=F', '')
                 
-                if signal == "BUY":
+                # --- LOGIC ---
+                # BUY: Prev < Mid AND Curr > Mid
+                if prev['Close'] < prev['Middle'] and today['Close'] > today['Middle']:
+                    # Filters
+                    if use_trend and today['Close'] < today['SMA_200']: continue
+                    if use_rsi and today['RSI'] > 70: continue
+                    
                     results_buy.append({
                         "Symbol": display_name,
-                        "Price": round(price, 2),
-                        "Signal Date": date.strftime('%Y-%m-%d')
+                        "Price": round(today['Close'], 2),
+                        "RSI": round(today['RSI'], 1),
+                        "Trend": "⬆️ Uptrend" if today['Close'] > today['SMA_200'] else "⬇️ Weak"
                     })
-                elif signal == "SELL":
+                
+                # SELL: Prev > Mid AND Curr < Mid
+                elif prev['Close'] > prev['Middle'] and today['Close'] < today['Middle']:
                     results_sell.append({
                         "Symbol": display_name,
-                        "Price": round(price, 2),
-                        "Signal Date": date.strftime('%Y-%m-%d')
+                        "Price": round(today['Close'], 2),
+                        "Signal Date": today.name.strftime('%Y-%m-%d')
                     })
                     
-            except Exception:
-                continue 
-        
+            except: continue
+            
         progress.progress((i + 1) / len(total_chunks))
-    
+        
     progress.empty()
-    status_text.empty()
+    status.empty()
     return results_buy, results_sell
 
-def deep_dive_analysis(ticker):
-    """Historical Analysis for Single Stock"""
+def deep_dive(ticker):
+    """Historical Check"""
     try:
-        # Search Mapping
         search_t = ticker
         rev_map = {k.split()[0].upper(): v for k, v in COMMODITIES.items()}
         if search_t in rev_map: search_t = rev_map[search_t]
         elif not search_t.endswith(".NS") and "=" not in search_t: search_t += ".NS"
-
-        # Fetch 1 Year Data
-        df = yf.download(search_t, period="1y", progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        if len(df) < 20: return None, None
-
-        # Strategy
-        df['High_20'] = df['High'].rolling(20).max()
-        df['Low_20'] = df['Low'].rolling(20).min()
-        df['Middle'] = (df['High_20'] + df['Low_20']) / 2
         
+        df = yf.download(search_t, period="2y", progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        
+        df = calculate_indicators(df)
         curr = df.iloc[-1]
         
-        # Trend Status
         is_bullish = curr['Close'] > curr['Middle']
-        trend_txt = "BULLISH (Buy Zone)" if is_bullish else "BEARISH (Sell Zone)"
+        status = "BULLISH (Buy Zone)" if is_bullish else "BEARISH (Sell Zone)"
         
-        # Historical Signals
-        df['Buy_Cross'] = (df['Close'] > df['Middle']) & (df['Close'].shift(1) < df['Middle'].shift(1))
-        df['Sell_Cross'] = (df['Close'] < df['Middle']) & (df['Close'].shift(1) > df['Middle'].shift(1))
+        # Find Crossover
+        df['Buy_X'] = (df['Close'] > df['Middle']) & (df['Close'].shift(1) < df['Middle'].shift(1))
+        df['Sell_X'] = (df['Close'] < df['Middle']) & (df['Close'].shift(1) > df['Middle'].shift(1))
         
-        last_buy = df[df['Buy_Cross']].tail(1)
-        last_sell = df[df['Sell_Cross']].tail(1)
+        last_buy = df[df['Buy_X']].tail(1)
+        last_sell = df[df['Sell_X']].tail(1)
         
         res = {
             "name": ticker.replace('.NS', ''),
             "cmp": round(curr['Close'], 2),
-            "trend": trend_txt,
+            "status": status,
             "is_bullish": is_bullish,
-            "buy_date": "-", "buy_price": 0,
-            "sell_date": "-", "sell_price": 0,
-            "pnl": 0.0
+            "buy_date": "-", "buy_price": 0, "pnl": 0.0,
+            "sell_date": "-", "sell_price": 0
         }
         
         if not last_buy.empty:
@@ -233,77 +216,67 @@ def deep_dive_analysis(ticker):
             res['sell_price'] = round(last_sell['Close'].values[-1], 2)
             
         return res, df
-    except:
-        return None, None
+    except: return None, None
 
 # --- 5. UI LAYOUT ---
-tab1, tab2 = st.tabs(["🚀 Market Scanner", "🔍 Deep Dive Analysis"])
+tab1, tab2 = st.tabs(["🚀 Market Scanner", "🔍 Deep Dive"])
 
 with tab1:
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        st.subheader("Config")
-        market = st.radio("Market", ["NSE 500 (Full)", "Commodities"])
-        run_btn = st.button("RUN SCANNER", type="primary")
+    st.sidebar.header("⚙️ Scanner Settings")
+    market = st.sidebar.radio("Select Market", ["NSE 500 (Full)", "Commodities"])
+    
+    st.sidebar.markdown("---")
+    st.sidebar.caption("✅ Buy Filters (Optional)")
+    trend_filter = st.sidebar.checkbox("Trend Filter (Price > 200 SMA)", True)
+    rsi_filter = st.sidebar.checkbox("RSI Filter (RSI < 70)", True)
+    
+    if st.button("RUN SCANNER", type="primary"):
+        t_list = NSE_500_LIST if market == "NSE 500 (Full)" else list(COMMODITIES.values())
+        buys, sells = run_scan(t_list, trend_filter, rsi_filter)
+        st.session_state['buys'] = buys
+        st.session_state['sells'] = sells
         
-    with col2:
-        if run_btn:
-            scan_list = NSE_500_LIST if market == "NSE 500 (Full)" else list(COMMODITIES.values())
-            st.toast(f"Starting Scan on {len(scan_list)} assets...")
-            buys, sells = run_robust_scan(scan_list)
-            
-            st.session_state['scan_buys'] = buys
-            st.session_state['scan_sells'] = sells
-            
-        # Results Display
-        if 'scan_buys' in st.session_state:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.success(f"✅ BUY SIGNALS ({len(st.session_state['scan_buys'])})")
-                if st.session_state['scan_buys']:
-                    df_b = pd.DataFrame(st.session_state['scan_buys'])
-                    st.dataframe(df_b, hide_index=True, use_container_width=True)
-                    
-                    # One-Click Analyze
-                    selected_buy = st.selectbox("Analyze a Buy Signal:", ["Select..."] + df_b['Symbol'].tolist())
-                    if selected_buy != "Select...":
-                        st.session_state['analyze_ticker'] = selected_buy
+    if 'buys' in st.session_state:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.success(f"✅ BUY SIGNALS ({len(st.session_state['buys'])})")
+            if st.session_state['buys']:
+                df_b = pd.DataFrame(st.session_state['buys'])
+                st.dataframe(df_b, hide_index=True, use_container_width=True)
+                
+                # Clickable Logic
+                opts = ["Select to Analyze..."] + df_b['Symbol'].tolist()
+                sel = st.selectbox("Analyze Stock:", opts)
+                if sel != "Select to Analyze...":
+                    st.session_state['analyze_ticker'] = sel
 
-            with c2:
-                st.error(f"❌ SELL SIGNALS ({len(st.session_state['scan_sells'])})")
-                if st.session_state['scan_sells']:
-                    df_s = pd.DataFrame(st.session_state['scan_sells'])
-                    st.dataframe(df_s, hide_index=True, use_container_width=True)
+        with c2:
+            st.error(f"❌ SELL SIGNALS ({len(st.session_state['sells'])})")
+            if st.session_state['sells']:
+                st.dataframe(pd.DataFrame(st.session_state['sells']), hide_index=True, use_container_width=True)
 
 with tab2:
     st.header("Deep Dive Analysis")
+    default = st.session_state.get('analyze_ticker', '')
+    user_in = st.text_input("Enter Symbol (e.g. RELIANCE)", value=default).upper().strip()
     
-    # Input Handling
-    default_val = st.session_state.get('analyze_ticker', '')
-    user_input = st.text_input("Enter Symbol (e.g. RELIANCE, GOLD)", value=default_val).upper().strip()
-    
-    if st.button("ANALYZE STOCK") or user_input:
-        if user_input:
-            data, chart_df = deep_dive_analysis(user_input)
-            
+    if st.button("ANALYZE") or user_in:
+        if user_in:
+            data, chart = deep_dive(user_in)
             if data:
-                # Dynamic Banner
                 color = "buy-signal" if data['is_bullish'] else "sell-signal"
                 st.markdown(f"""
                     <div class="metric-box {color}">
                         <h2>{data['name']}</h2>
-                        <h3>CMP: {data['cmp']} | {data['trend']}</h3>
+                        <h3>CMP: {data['cmp']} | {data['status']}</h3>
                     </div>
                 """, unsafe_allow_html=True)
                 
-                # Metrics Grid
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Last Buy Signal", f"{data['buy_date']}", f"@{data['buy_price']}")
                 m2.metric("Last Sell Signal", f"{data['sell_date']}", f"@{data['sell_price']}")
-                m3.metric("Current P&L", f"{data['pnl']}%", delta_color="normal")
+                m3.metric("Current P&L", f"{data['pnl']}%")
                 
-                # Chart
-                if chart_df is not None:
-                    st.line_chart(chart_df[['Close', 'Middle']])
-            else:
-                st.error("Data not found. Please check symbol.")
+                if chart is not None:
+                    st.line_chart(chart[['Close', 'Middle']])
+            else: st.error("Stock not found.")
