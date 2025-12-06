@@ -4,9 +4,9 @@ import pandas as pd
 import numpy as np
 
 # --- 1. CONFIGURATION ---
-st.set_page_config(page_title="Donchian Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Donchian Pro Backtester", layout="wide", initial_sidebar_state="expanded")
 
-# CSS: Hide Footer/Deploy, professional look
+# CSS: Professional UI
 st.markdown("""
     <style>
         #MainMenu {visibility: hidden;}
@@ -23,7 +23,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ Donchian Trend Sniper (Pro Filters)")
+st.title("⚡ Donchian Strategy: Scanner & Backtester")
 
 # --- 2. ASSET LISTS ---
 COMMODITIES = {
@@ -31,7 +31,6 @@ COMMODITIES = {
     'Crude Oil': 'CL=F', 'Natural Gas': 'NG=F', 'Aluminum': 'ALI=F'
 }
 
-# COMPLETE NIFTY 500 LIST
 NSE_500_LIST = [
     'M&MFIN.NS', 'RCF.NS', 'PATANJALI.NS', 'SBICARD.NS', 'SUNDARMFIN.NS', 'PTCIL.NS', 'INDUSTOWER.NS', 'CHOLAFIN.NS', 'LTF.NS', 'SKFINDUS.NS',
     'SHRIRAMFIN.NS', 'MARICO.NS', 'DEEPAKNTR.NS', 'ABCAPITAL.NS', 'SBIN.NS', 'PNBHOUSING.NS', 'MUTHOOTFIN.NS', 'RBLBANK.NS', 'POLICYBZR.NS', 'LLOYDSME.NS',
@@ -86,7 +85,7 @@ NSE_500_LIST = [
     'KAYNES.NS'
 ]
 
-# --- 3. ANALYTICS ENGINE ---
+# --- 3. ANALYTICS ENGINE (Vectorized) ---
 def calculate_indicators(df):
     """Calculates Donchian (20), SMA (200) and RSI (14)"""
     df['High_20'] = df['High'].rolling(20).max()
@@ -102,10 +101,10 @@ def calculate_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-def process_batch(tickers):
+def process_batch(tickers, period="1y"):
     """Downloads batch with AUTO-ADJUST"""
     try:
-        data = yf.download(tickers, period="1y", group_by='ticker', threads=True, progress=False, auto_adjust=True)
+        data = yf.download(tickers, period=period, group_by='ticker', threads=True, progress=False, auto_adjust=True)
         return data
     except Exception:
         return None
@@ -125,7 +124,7 @@ def run_scan(target_list, use_trend, use_rsi):
         batch = target_list[start_idx : start_idx + chunk_size]
         status.caption(f"Scanning batch {i+1}/{len(total_chunks)}...")
         
-        data = process_batch(batch)
+        data = process_batch(batch, period="1y")
         if data is None or data.empty: continue
         
         for ticker in batch:
@@ -139,13 +138,10 @@ def run_scan(target_list, use_trend, use_rsi):
                 today = df.iloc[-1]
                 prev = df.iloc[-2]
                 
-                # Format Name
                 display_name = ticker.replace('.NS', '').replace('=F', '')
                 
-                # --- LOGIC ---
                 # BUY: Prev < Mid AND Curr > Mid
                 if prev['Close'] < prev['Middle'] and today['Close'] > today['Middle']:
-                    # Filters
                     if use_trend and today['Close'] < today['SMA_200']: continue
                     if use_rsi and today['RSI'] > 70: continue
                     
@@ -172,6 +168,84 @@ def run_scan(target_list, use_trend, use_rsi):
     status.empty()
     return results_buy, results_sell
 
+# --- 5. BACKTEST LOGIC (UPDATE NO. 1) ---
+@st.cache_data(ttl=3600)
+def run_bulk_backtest(target_list):
+    """
+    Scans 2 years of history for ALL stocks.
+    Returns: Profitable List, Loss List
+    """
+    profitable = []
+    loss_making = []
+    
+    chunk_size = 50
+    total_chunks = range(0, len(target_list), chunk_size)
+    progress = st.progress(0)
+    status = st.empty()
+    
+    for i, start_idx in enumerate(total_chunks):
+        batch = target_list[start_idx : start_idx + chunk_size]
+        status.caption(f"Backtesting batch {i+1}/{len(total_chunks)}...")
+        
+        # Download 2 years data
+        data = process_batch(batch, period="2y")
+        if data is None or data.empty: continue
+        
+        for ticker in batch:
+            try:
+                df = data[ticker] if len(batch) > 1 else data.copy()
+                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                df = df.dropna()
+                if len(df) < 200: continue
+                
+                # Calculate Indicators
+                df['High_20'] = df['High'].rolling(20).max()
+                df['Low_20'] = df['Low'].rolling(20).min()
+                df['Middle'] = (df['High_20'] + df['Low_20']) / 2
+                
+                # Generate Signals (1 = Hold, 0 = Flat)
+                # Logic: Be in market if Price > Middle.
+                # Strictly: Enter on Cross Up, Exit on Cross Down.
+                # Vectorized simulation: 
+                df['Signal'] = np.where(df['Close'] > df['Middle'], 1, 0)
+                df['Signal'] = df['Signal'].shift(1) # Trade on next day open/close? We use Close-to-Close for robust scan.
+                
+                # Calculate Strategy Returns
+                df['Daily_Ret'] = df['Close'].pct_change()
+                df['Strat_Ret'] = df['Daily_Ret'] * df['Signal']
+                
+                # Cumulative Return
+                cum_ret = (1 + df['Strat_Ret']).cumprod().iloc[-1] - 1
+                total_ret_pct = round(cum_ret * 100, 2)
+                
+                # Count Trades (approximate by signal changes)
+                trades = df['Signal'].diff().abs().sum() / 2
+                
+                entry = {
+                    "Symbol": ticker.replace('.NS', '').replace('=F', ''),
+                    "Total Return": f"{total_ret_pct}%",
+                    "Trades (Approx)": int(trades),
+                    "Raw_Ret": total_ret_pct
+                }
+                
+                if total_ret_pct > 0:
+                    profitable.append(entry)
+                else:
+                    loss_making.append(entry)
+                    
+            except: continue
+        
+        progress.progress((i + 1) / len(total_chunks))
+    
+    progress.empty()
+    status.empty()
+    
+    # Sort by performance
+    profitable.sort(key=lambda x: x['Raw_Ret'], reverse=True)
+    loss_making.sort(key=lambda x: x['Raw_Ret']) # Most negative first
+    
+    return profitable, loss_making
+
 def deep_dive(ticker):
     """Historical Check"""
     try:
@@ -189,7 +263,6 @@ def deep_dive(ticker):
         is_bullish = curr['Close'] > curr['Middle']
         status = "BULLISH (Buy Zone)" if is_bullish else "BEARISH (Sell Zone)"
         
-        # Find Crossover
         df['Buy_X'] = (df['Close'] > df['Middle']) & (df['Close'].shift(1) < df['Middle'].shift(1))
         df['Sell_X'] = (df['Close'] < df['Middle']) & (df['Close'].shift(1) > df['Middle'].shift(1))
         
@@ -218,8 +291,8 @@ def deep_dive(ticker):
         return res, df
     except: return None, None
 
-# --- 5. UI LAYOUT ---
-tab1, tab2 = st.tabs(["🚀 Market Scanner", "🔍 Deep Dive"])
+# --- 6. UI LAYOUT ---
+tab1, tab2, tab3 = st.tabs(["🚀 Market Scanner", "🔍 Deep Dive", "📊 Strategy Backtest"])
 
 with tab1:
     st.sidebar.header("⚙️ Scanner Settings")
@@ -244,7 +317,6 @@ with tab1:
                 df_b = pd.DataFrame(st.session_state['buys'])
                 st.dataframe(df_b, hide_index=True, use_container_width=True)
                 
-                # Clickable Logic
                 opts = ["Select to Analyze..."] + df_b['Symbol'].tolist()
                 sel = st.selectbox("Analyze Stock:", opts)
                 if sel != "Select to Analyze...":
@@ -280,3 +352,29 @@ with tab2:
                 if chart is not None:
                     st.line_chart(chart[['Close', 'Middle']])
             else: st.error("Stock not found.")
+
+with tab3:
+    st.header("📊 Strategy Performance (2 Years)")
+    st.write("This tool scans the history of all stocks to find where this strategy works best.")
+    
+    backtest_market = st.radio("Select Market for Backtest", ["NSE 500 (Full)", "Commodities"], key="bt_market")
+    
+    if st.button("RUN 2-YEAR BACKTEST", type="primary"):
+        t_list = NSE_500_LIST if backtest_market == "NSE 500 (Full)" else list(COMMODITIES.values())
+        
+        with st.spinner("Crunching 2 years of data for all stocks... (This takes about 60-90 seconds)"):
+            prof, loss = run_bulk_backtest(t_list)
+            
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                st.success(f"🏆 Profitable Stocks ({len(prof)})")
+                st.caption("Stocks where this strategy made money")
+                if prof:
+                    st.dataframe(pd.DataFrame(prof).drop(columns=['Raw_Ret']), use_container_width=True, hide_index=True)
+            
+            with col_b:
+                st.error(f"⚠️ Loss Making Stocks ({len(loss)})")
+                st.caption("Stocks where this strategy lost money")
+                if loss:
+                    st.dataframe(pd.DataFrame(loss).drop(columns=['Raw_Ret']), use_container_width=True, hide_index=True)
