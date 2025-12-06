@@ -3,24 +3,29 @@ import yfinance as yf
 import pandas as pd
 import math
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="Donchian 500 Scanner", layout="wide")
-st.title("⚡ Donchian Channel Scanner (Nifty 500 + Commodities)")
+# --- 1. CONFIGURATION & PRIVACY ---
+st.set_page_config(page_title="Market Sniper", layout="wide", initial_sidebar_state="expanded")
+
+# Hides Streamlit branding and "Manage App" buttons for viewers
 st.markdown("""
 <style>
-    div.stButton > button { background-color: #00C853; color: white; font-weight: bold; border: none; }
-    .stProgress > div > div > div > div { background-color: #00C853; }
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    div.stButton > button { background-color: #00C853; color: white; font-weight: bold; border: none; width: 100%; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. HARDCODED ASSET LISTS ---
-# Commodities (International Futures as proxies for MCX)
+st.title("⚡ Pro Trend Scanner")
+st.markdown("Strategy: **Donchian Breakout (20)** with Volume & Trend Confirmation.")
+
+# --- 2. ASSET LISTS (FULL NIFTY 500) ---
 COMMODITIES = {
     'Gold (Global)': 'GC=F', 'Silver (Global)': 'SI=F', 'Copper (Global)': 'HG=F',
     'Aluminum': 'ALI=F', 'Crude Oil': 'CL=F', 'Natural Gas': 'NG=F'
 }
 
-# Nifty 500 List (Hardcoded from your upload)
+# Full Nifty 500 List
 NSE_500_LIST = [
     'M&MFIN.NS', 'RCF.NS', 'PATANJALI.NS', 'SBICARD.NS', 'SUNDARMFIN.NS', 'PTCIL.NS', 'INDUSTOWER.NS', 'CHOLAFIN.NS', 'LTF.NS', 'SKFINDUS.NS', 
     'SHRIRAMFIN.NS', 'MARICO.NS', 'DEEPAKNTR.NS', 'ABCAPITAL.NS', 'SBIN.NS', 'PNBHOUSING.NS', 'MUTHOOTFIN.NS', 'RBLBANK.NS', 'POLICYBZR.NS', 'LLOYDSME.NS', 
@@ -75,170 +80,136 @@ NSE_500_LIST = [
     'KAYNES.NS'
 ]
 
-# --- 3. HELPER FUNCTIONS ---
-def get_donchian_signal(df):
-    """
-    Returns 'BUY', 'EXIT' or 'NONE' based on Donchian Middle Band crossover.
-    Strategy: 
-    - BUY: Close crosses ABOVE Middle Band from below.
-    - EXIT: Close crosses BELOW Middle Band from above.
-    """
-    if len(df) < 22: return None, 0
-    
-    # Calculate Middle Band (20 period)
-    df['High_20'] = df['High'].rolling(20).max()
-    df['Low_20'] = df['Low'].rolling(20).min()
-    df['Middle'] = (df['High_20'] + df['Low_20']) / 2
-    
-    # Get last two days
-    today = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    # Buy Condition
-    if prev['Close'] < prev['Middle'] and today['Close'] > today['Middle']:
-        return "BUY", today['Close']
-    
-    # Exit Condition
-    elif prev['Close'] > prev['Middle'] and today['Close'] < today['Middle']:
-        return "EXIT", today['Close']
-        
-    return "NONE", 0
-
-def find_last_historical_signal(ticker):
-    """Finds the last time a signal occurred in history."""
+# --- 3. CORE STRATEGY ---
+@st.cache_data(ttl=3600)  # Cache data for 1 hour so friends don't break limits
+def fetch_and_scan(tickers, use_trend_filter=False):
     try:
-        df = yf.download(ticker, period="1y", progress=False)
-        if df.empty: return None, None, None
-        
-        # Flatten MultiIndex if present
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            
-        df['High_20'] = df['High'].rolling(20).max()
-        df['Low_20'] = df['Low'].rolling(20).min()
-        df['Middle'] = (df['High_20'] + df['Low_20']) / 2
-        
-        df['Prev_Close'] = df['Close'].shift(1)
-        df['Prev_Middle'] = df['Middle'].shift(1)
-        
-        df['Buy'] = (df['Prev_Close'] < df['Prev_Middle']) & (df['Close'] > df['Middle'])
-        df['Exit'] = (df['Prev_Close'] > df['Prev_Middle']) & (df['Close'] < df['Middle'])
-        
-        last_buy = df[df['Buy']].tail(1)
-        last_exit = df[df['Exit']].tail(1)
-        
-        buy_info = (last_buy.index[-1].date(), round(last_buy['Close'].values[-1], 2)) if not last_buy.empty else ("None", 0)
-        exit_info = (last_exit.index[-1].date(), round(last_exit['Close'].values[-1], 2)) if not last_exit.empty else ("None", 0)
-        
-        current_status = "BULLISH (In Trade)" if df['Close'].iloc[-1] > df['Middle'].iloc[-1] else "BEARISH (Out of Trade)"
-        
-        return buy_info, exit_info, current_status
+        data = yf.download(tickers, period="1y", group_by='ticker', threads=True, progress=False)
     except:
-        return None, None, None
+        return [], []
+
+    buy_signals = []
+    exit_signals = []
+
+    for ticker in tickers:
+        try:
+            df = data[ticker] if len(tickers) > 1 else data
+            # Handle formatting issues
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna()
+            
+            if len(df) < 200: continue # Skip new listings if not enough data
+            
+            # 1. Indicators
+            df['High_20'] = df['High'].rolling(20).max()
+            df['Low_20'] = df['Low'].rolling(20).min()
+            df['Middle'] = (df['High_20'] + df['Low_20']) / 2
+            df['SMA_200'] = df['Close'].rolling(200).mean()
+            
+            # Volume Calc (Avg 20 days)
+            df['Vol_Avg'] = df['Volume'].rolling(20).mean()
+
+            # 2. Signal Logic
+            today = df.iloc[-1]
+            prev = df.iloc[-2]
+            
+            # Name Cleaning
+            name = ticker.replace('.NS', '')
+            
+            # Logic: BUY
+            if prev['Close'] < prev['Middle'] and today['Close'] > today['Middle']:
+                # Trend Filter Check
+                if use_trend_filter and today['Close'] < today['SMA_200']:
+                    continue # Skip if in downtrend
+                
+                # Volume Check
+                vol_status = "🔥 HIGH" if today['Volume'] > (today['Vol_Avg'] * 1.5) else "Normal"
+                
+                buy_signals.append({
+                    "Stock": name, 
+                    "CMP (₹)": round(today['Close'], 2),
+                    "Volume": vol_status,
+                    "Trend (200SMA)": "Uptrend" if today['Close'] > today['SMA_200'] else "Downtrend"
+                })
+            
+            # Logic: EXIT
+            elif prev['Close'] > prev['Middle'] and today['Close'] < today['Middle']:
+                exit_signals.append({
+                    "Stock": name, 
+                    "CMP (₹)": round(today['Close'], 2),
+                    "Trend (200SMA)": "Uptrend" if today['Close'] > today['SMA_200'] else "Downtrend"
+                })
+                
+        except:
+            continue
+            
+    return buy_signals, exit_signals
 
 # --- 4. APP INTERFACE ---
-tab1, tab2 = st.tabs(["🚀 Market Scanner", "🔍 Check Specific Stock"])
+tab1, tab2 = st.tabs(["🚀 Market Scanner", "🔍 Check Single Stock"])
 
-# === TAB 1: SCANNER ===
+# === TAB 1: BULK SCANNER ===
 with tab1:
-    st.header("Daily Scanner")
-    market_choice = st.radio("Select Market:", ["NSE Nifty 500 (Hardcoded)", "Commodities"], horizontal=True)
+    st.sidebar.header("Scanner Settings")
+    market = st.sidebar.radio("Select Market", ["NSE Nifty 500", "Commodities"])
     
-    if st.button("RUN SCANNER", key="scan"):
-        status_text = st.empty()
-        progress_bar = st.progress(0)
-        
-        if market_choice == "Commodities":
-            scan_list = list(COMMODITIES.values())
-            display_map = {v: k for k, v in COMMODITIES.items()}
-        else:
-            scan_list = NSE_500_LIST
-            display_map = {}
+    # New Feature: Trend Filter
+    trend_filter = False
+    if market == "NSE Nifty 500":
+        trend_filter = st.sidebar.checkbox("Only Buy in Uptrend (Above 200 SMA)?", value=False)
+        st.sidebar.caption("Filters out weak stocks preventing false buy signals.")
+    
+    if st.button("RUN SCANNER"):
+        with st.spinner("Fetching data from Yahoo Finance... (This takes 10-15 seconds)"):
+            target_list = NSE_500_LIST if market == "NSE Nifty 500" else list(COMMODITIES.values())
+            buys, exits = fetch_and_scan(target_list, trend_filter)
             
-        buy_signals = []
-        exit_signals = []
-        
-        # We chunk requests to avoid timeouts with 500 stocks
-        chunk_size = 50
-        total_chunks = math.ceil(len(scan_list) / chunk_size)
-        
-        for i in range(total_chunks):
-            chunk = scan_list[i*chunk_size : (i+1)*chunk_size]
-            status_text.text(f"Scanning batch {i+1} of {total_chunks}...")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.success(f"✅ BUY SIGNALS ({len(buys)})")
+                if buys:
+                    df_buy = pd.DataFrame(buys)
+                    st.dataframe(df_buy, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No Buy signals found.")
+
+            with col2:
+                st.error(f"❌ EXIT SIGNALS ({len(exits)})")
+                if exits:
+                    df_exit = pd.DataFrame(exits)
+                    st.dataframe(df_exit, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No Exit signals found.")
+
+# === TAB 2: SINGLE STOCK CHECK ===
+with tab2:
+    st.header("Check Specific Stock")
+    symbol = st.text_input("Enter Symbol (e.g. TATASTEEL)", "").upper()
+    
+    if st.button("Check Now"):
+        if symbol:
+            # Map commodity names if needed
+            t_search = symbol
+            rev_map = {k.split()[0].upper(): v for k, v in COMMODITIES.items()}
+            if t_search in rev_map: t_search = rev_map[t_search]
+            elif not t_search.endswith(".NS") and "=" not in t_search: t_search += ".NS"
             
             try:
-                # Bulk Download
-                data = yf.download(chunk, period="3mo", group_by='ticker', threads=True, progress=False)
+                df = yf.download(t_search, period="1y", progress=False)
+                # Cleaning
+                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                 
-                for ticker in chunk:
-                    try:
-                        # Extract individual stock data
-                        df = data[ticker] if len(chunk) > 1 else data
-                        if df.empty: continue
-                        
-                        # Fix columns if needed
-                        if isinstance(df.columns, pd.MultiIndex):
-                            df.columns = df.columns.get_level_values(0)
-                        
-                        df = df.dropna()
-                        signal, price = get_donchian_signal(df)
-                        
-                        name = display_map.get(ticker, ticker.replace('.NS', ''))
-                        
-                        if signal == "BUY":
-                            buy_signals.append({"Stock": name, "Price": round(price, 2)})
-                        elif signal == "EXIT":
-                            exit_signals.append({"Stock": name, "Price": round(price, 2)})
-                    except:
-                        continue
+                df['High_20'] = df['High'].rolling(20).max()
+                df['Low_20'] = df['Low'].rolling(20).min()
+                df['Middle'] = (df['High_20'] + df['Low_20']) / 2
+                
+                curr = df.iloc[-1]
+                status = "✅ BUY ZONE" if curr['Close'] > curr['Middle'] else "❌ EXIT ZONE"
+                
+                st.metric(label=f"Current Status of {symbol}", value=status, delta=f"CMP: {round(curr['Close'], 2)}")
+                st.line_chart(df[['Close', 'Middle']].tail(100))
+                
             except:
-                pass
-            
-            progress_bar.progress((i + 1) / total_chunks)
-            
-        status_text.text("Scan Complete!")
-        progress_bar.empty()
-        
-        # Display Results
-        c1, c2 = st.columns(2)
-        with c1:
-            st.success(f"✅ BUY SIGNALS ({len(buy_signals)})")
-            if buy_signals:
-                st.dataframe(pd.DataFrame(buy_signals), use_container_width=True, hide_index=True)
-            else:
-                st.write("No Buy signals today.")
-                
-        with c2:
-            st.error(f"❌ EXIT SIGNALS ({len(exit_signals)})")
-            if exit_signals:
-                st.dataframe(pd.DataFrame(exit_signals), use_container_width=True, hide_index=True)
-            else:
-                st.write("No Exit signals today.")
-
-# === TAB 2: CHECKER ===
-with tab2:
-    st.header("Stock Signal History")
-    st.markdown("Check when a specific stock last triggered a signal.")
-    
-    user_input = st.text_input("Enter Symbol (e.g., RELIANCE, TATASTEEL, GOLD, SILVER)", "").upper().strip()
-    
-    if st.button("Check History"):
-        if user_input:
-            # Handle commodity names map
-            ticker_search = user_input
-            rev_map = {k.split()[0].upper(): v for k, v in COMMODITIES.items()} # Map GOLD -> GC=F
-            if ticker_search in rev_map:
-                ticker_search = rev_map[ticker_search]
-            elif not ticker_search.endswith(".NS") and "=" not in ticker_search:
-                ticker_search += ".NS"
-                
-            with st.spinner(f"Analyzing {ticker_search}..."):
-                last_buy, last_exit, status = find_last_historical_signal(ticker_search)
-                
-                if status:
-                    st.subheader(f"{user_input}: {status}")
-                    m1, m2 = st.columns(2)
-                    m1.metric("Last BUY Signal", f"{last_buy[0]}", f"₹ {last_buy[1]}")
-                    m2.metric("Last EXIT Signal", f"{last_exit[0]}", f"₹ {last_exit[1]}")
-                else:
-                    st.error("Could not fetch data. Please check the spelling.")
+                st.error("Stock not found.")
