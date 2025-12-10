@@ -4,9 +4,13 @@ import pandas as pd
 import numpy as np
 
 # --- 1. CONFIGURATION ---
-st.set_page_config(page_title="Donchian Pro Backtester", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="DC - Created by Rishabh", 
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
 
-# CSS: Professional UI
+# CSS: Professional UI & Mobile Optimizations
 st.markdown("""
     <style>
         #MainMenu {visibility: hidden;}
@@ -14,16 +18,30 @@ st.markdown("""
         header {visibility: hidden;}
         .stDeployButton {display:none;}
         
-        div.stButton > button { background-color: #00C853; color: white; font-weight: bold; border: none; width: 100%; }
+        /* Button Styling */
+        div.stButton > button { 
+            background-color: #00C853; 
+            color: white; 
+            font-weight: bold; 
+            border: none; 
+            width: 100%; 
+        }
         
-        .metric-box { padding: 15px; border-radius: 8px; text-align: center; margin-bottom: 10px; border: 1px solid #ddd; }
+        /* Metric Box Styling */
+        .metric-box { 
+            padding: 15px; 
+            border-radius: 8px; 
+            text-align: center; 
+            margin-bottom: 10px; 
+            border: 1px solid #ddd; 
+        }
         .buy-signal { background-color: #d4edda; color: #155724; border-color: #c3e6cb; }
         .sell-signal { background-color: #f8d7da; color: #721c24; border-color: #f5c6cb; }
         .neutral { background-color: #f8f9fa; color: #666; }
     </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ Donchian Strategy: Scanner & Backtester")
+st.title("⚡ DC - Created by Rishabh")
 
 # --- 2. ASSET LISTS ---
 COMMODITIES = {
@@ -85,7 +103,7 @@ NSE_500_LIST = [
     'KAYNES.NS'
 ]
 
-# --- 3. ANALYTICS ENGINE (Vectorized) ---
+# --- 3. ANALYTICS ENGINE ---
 def calculate_indicators(df):
     """Calculates Donchian (20), SMA (200) and RSI (14)"""
     df['High_20'] = df['High'].rolling(20).max()
@@ -101,9 +119,34 @@ def calculate_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-def process_batch(tickers, period="1y"):
+def get_strategy_stats(df):
+    """
+    Calculates 2-Year Backtest metrics on the fly.
+    Returns: Total Return % (float), Trade Count (int)
+    """
+    # 1. Generate Signal: 1 (Hold), 0 (Flat)
+    # Be in market if Price > Middle
+    df['Signal_Strat'] = np.where(df['Close'] > df['Middle'], 1, 0)
+    df['Signal_Strat'] = df['Signal_Strat'].shift(1) # Enter next day (or close-to-close sim)
+    
+    # 2. Calculate Returns
+    df['Daily_Ret'] = df['Close'].pct_change()
+    df['Strat_Ret'] = df['Daily_Ret'] * df['Signal_Strat']
+    
+    # 3. Cumulative Metrics
+    cum_ret = (1 + df['Strat_Ret']).cumprod().iloc[-1] - 1
+    total_ret_pct = round(cum_ret * 100, 2)
+    
+    # 4. Count Trades (transitions from 0 to 1 or 1 to 0)
+    # We divide by 2 because a full trade is Buy + Sell
+    trades = df['Signal_Strat'].diff().abs().sum() / 2
+    
+    return total_ret_pct, int(trades)
+
+def process_batch(tickers, period="2y"):
     """Downloads batch with AUTO-ADJUST"""
     try:
+        # Fixed to 2y to ensure we always have enough data for backtesting stats
         data = yf.download(tickers, period=period, group_by='ticker', threads=True, progress=False, auto_adjust=True)
         return data
     except Exception:
@@ -122,9 +165,10 @@ def run_scan(target_list, use_trend, use_rsi):
     
     for i, start_idx in enumerate(total_chunks):
         batch = target_list[start_idx : start_idx + chunk_size]
-        status.caption(f"Scanning batch {i+1}/{len(total_chunks)}...")
+        status.caption(f"Scanning & Backtesting batch {i+1}/{len(total_chunks)}...")
         
-        data = process_batch(batch, period="1y")
+        # Download 2 years data to support on-the-fly backtesting
+        data = process_batch(batch, period="2y")
         if data is None or data.empty: continue
         
         for ticker in batch:
@@ -145,19 +189,29 @@ def run_scan(target_list, use_trend, use_rsi):
                     if use_trend and today['Close'] < today['SMA_200']: continue
                     if use_rsi and today['RSI'] > 70: continue
                     
+                    # Run Instant Backtest
+                    ret_2y, trades_2y = get_strategy_stats(df)
+                    
                     results_buy.append({
                         "Symbol": display_name,
                         "Price": round(today['Close'], 2),
                         "RSI": round(today['RSI'], 1),
-                        "Trend": "⬆️ Uptrend" if today['Close'] > today['SMA_200'] else "⬇️ Weak"
+                        "Trend": "⬆️ Uptrend" if today['Close'] > today['SMA_200'] else "⬇️ Weak",
+                        "Total Ret (2Y)": f"{ret_2y}%",
+                        "Trades (2Y)": trades_2y
                     })
                 
                 # SELL: Prev > Mid AND Curr < Mid
                 elif prev['Close'] > prev['Middle'] and today['Close'] < today['Middle']:
+                    # Run Instant Backtest
+                    ret_2y, trades_2y = get_strategy_stats(df)
+                    
                     results_sell.append({
                         "Symbol": display_name,
                         "Price": round(today['Close'], 2),
-                        "Signal Date": today.name.strftime('%Y-%m-%d')
+                        "Signal Date": today.name.strftime('%Y-%m-%d'),
+                        "Total Ret (2Y)": f"{ret_2y}%",
+                        "Trades (2Y)": trades_2y
                     })
                     
             except: continue
@@ -168,7 +222,7 @@ def run_scan(target_list, use_trend, use_rsi):
     status.empty()
     return results_buy, results_sell
 
-# --- 5. BACKTEST LOGIC (UPDATE NO. 1) ---
+# --- 5. BACKTEST LOGIC (Bulk) ---
 @st.cache_data(ttl=3600)
 def run_bulk_backtest(target_list):
     """
@@ -187,7 +241,6 @@ def run_bulk_backtest(target_list):
         batch = target_list[start_idx : start_idx + chunk_size]
         status.caption(f"Backtesting batch {i+1}/{len(total_chunks)}...")
         
-        # Download 2 years data
         data = process_batch(batch, period="2y")
         if data is None or data.empty: continue
         
@@ -198,33 +251,15 @@ def run_bulk_backtest(target_list):
                 df = df.dropna()
                 if len(df) < 200: continue
                 
-                # Calculate Indicators
-                df['High_20'] = df['High'].rolling(20).max()
-                df['Low_20'] = df['Low'].rolling(20).min()
-                df['Middle'] = (df['High_20'] + df['Low_20']) / 2
+                df = calculate_indicators(df)
                 
-                # Generate Signals (1 = Hold, 0 = Flat)
-                # Logic: Be in market if Price > Middle.
-                # Strictly: Enter on Cross Up, Exit on Cross Down.
-                # Vectorized simulation: 
-                df['Signal'] = np.where(df['Close'] > df['Middle'], 1, 0)
-                df['Signal'] = df['Signal'].shift(1) # Trade on next day open/close? We use Close-to-Close for robust scan.
-                
-                # Calculate Strategy Returns
-                df['Daily_Ret'] = df['Close'].pct_change()
-                df['Strat_Ret'] = df['Daily_Ret'] * df['Signal']
-                
-                # Cumulative Return
-                cum_ret = (1 + df['Strat_Ret']).cumprod().iloc[-1] - 1
-                total_ret_pct = round(cum_ret * 100, 2)
-                
-                # Count Trades (approximate by signal changes)
-                trades = df['Signal'].diff().abs().sum() / 2
+                # Reuse helper function
+                total_ret_pct, trades = get_strategy_stats(df)
                 
                 entry = {
                     "Symbol": ticker.replace('.NS', '').replace('=F', ''),
                     "Total Return": f"{total_ret_pct}%",
-                    "Trades (Approx)": int(trades),
+                    "Trades (Approx)": trades,
                     "Raw_Ret": total_ret_pct
                 }
                 
@@ -260,6 +295,9 @@ def deep_dive(ticker):
         df = calculate_indicators(df)
         curr = df.iloc[-1]
         
+        # Strategy Metrics
+        ret_2y, trades_2y = get_strategy_stats(df)
+        
         is_bullish = curr['Close'] > curr['Middle']
         status = "BULLISH (Buy Zone)" if is_bullish else "BEARISH (Sell Zone)"
         
@@ -275,7 +313,9 @@ def deep_dive(ticker):
             "status": status,
             "is_bullish": is_bullish,
             "buy_date": "-", "buy_price": 0, "pnl": 0.0,
-            "sell_date": "-", "sell_price": 0
+            "sell_date": "-", "sell_price": 0,
+            "ret_2y": ret_2y,
+            "trades_2y": trades_2y
         }
         
         if not last_buy.empty:
@@ -292,22 +332,29 @@ def deep_dive(ticker):
     except: return None, None
 
 # --- 6. UI LAYOUT ---
-tab1, tab2, tab3 = st.tabs(["🚀 Market Scanner", "🔍 Deep Dive", "📊 Strategy Backtest"])
+# Mobile Optimization: Controls moved to Main Page Expander
+with st.expander("⚙️ Scanner Settings & Controls", expanded=True):
+    c1, c2, c3 = st.columns([1,1,1])
+    with c1:
+        market = st.radio("Select Market", ["NSE 500 (Full)", "Commodities"])
+    with c2:
+        st.caption("Filters")
+        trend_filter = st.checkbox("Trend Filter (>200 SMA)", True)
+        rsi_filter = st.checkbox("RSI Filter (<70)", True)
+    with c3:
+        st.write("")
+        st.write("")
+        run_btn = st.button("RUN SCANNER", type="primary")
+
+tab1, tab2, tab3 = st.tabs(["🚀 Market Scanner", "🔍 Deep Dive", "📊 Bulk Backtest"])
 
 with tab1:
-    st.sidebar.header("⚙️ Scanner Settings")
-    market = st.sidebar.radio("Select Market", ["NSE 500 (Full)", "Commodities"])
-    
-    st.sidebar.markdown("---")
-    st.sidebar.caption("✅ Buy Filters (Optional)")
-    trend_filter = st.sidebar.checkbox("Trend Filter (Price > 200 SMA)", True)
-    rsi_filter = st.sidebar.checkbox("RSI Filter (RSI < 70)", True)
-    
-    if st.button("RUN SCANNER", type="primary"):
+    if run_btn:
         t_list = NSE_500_LIST if market == "NSE 500 (Full)" else list(COMMODITIES.values())
-        buys, sells = run_scan(t_list, trend_filter, rsi_filter)
-        st.session_state['buys'] = buys
-        st.session_state['sells'] = sells
+        with st.spinner("Scanning & Calculating 2-Year Returns..."):
+            buys, sells = run_scan(t_list, trend_filter, rsi_filter)
+            st.session_state['buys'] = buys
+            st.session_state['sells'] = sells
         
     if 'buys' in st.session_state:
         c1, c2 = st.columns(2)
@@ -341,6 +388,7 @@ with tab2:
                     <div class="metric-box {color}">
                         <h2>{data['name']}</h2>
                         <h3>CMP: {data['cmp']} | {data['status']}</h3>
+                        <p><b>2-Year Strategy Return:</b> {data['ret_2y']}% | <b>Total Trades:</b> {data['trades_2y']}</p>
                     </div>
                 """, unsafe_allow_html=True)
                 
@@ -349,20 +397,20 @@ with tab2:
                 m2.metric("Last Sell Signal", f"{data['sell_date']}", f"@{data['sell_price']}")
                 m3.metric("Current P&L", f"{data['pnl']}%")
                 
-                if chart is not None:
-                    st.line_chart(chart[['Close', 'Middle']])
+                # Chart removed as requested
+                st.info("Chart removed to focus on data.")
             else: st.error("Stock not found.")
 
 with tab3:
     st.header("📊 Strategy Performance (2 Years)")
-    st.write("This tool scans the history of all stocks to find where this strategy works best.")
+    st.write("Bulk scan of all 500 stocks to find historical winners.")
     
     backtest_market = st.radio("Select Market for Backtest", ["NSE 500 (Full)", "Commodities"], key="bt_market")
     
-    if st.button("RUN 2-YEAR BACKTEST", type="primary"):
+    if st.button("RUN BULK BACKTEST", type="primary"):
         t_list = NSE_500_LIST if backtest_market == "NSE 500 (Full)" else list(COMMODITIES.values())
         
-        with st.spinner("Crunching 2 years of data for all stocks... (This takes about 60-90 seconds)"):
+        with st.spinner("Crunching 2 years of data for all stocks... (60-90s)"):
             prof, loss = run_bulk_backtest(t_list)
             
             col_a, col_b = st.columns(2)
