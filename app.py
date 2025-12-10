@@ -197,27 +197,34 @@ def run_scan(target_list, use_trend, use_rsi):
                         "Price": round(today['Close'], 2),
                         "RSI": round(today['RSI'], 1),
                         "Trend": "⬆️ Uptrend" if today['Close'] > today['SMA_200'] else "⬇️ Weak",
-                        "Total Ret (2Y)": f"{ret_2y}%",
-                        "Trades (2Y)": trades_2y
+                        # Backtest result - Raw values used for sorting, strings for display later if needed
+                        "raw_ret": ret_2y, 
+                        "Trades (2Y)": trades_2y,
+                        "Total Ret (2Y Backtest)": f"{ret_2y}%" # Formatted for display
                     })
                 
                 # SELL: Prev > Mid AND Curr < Mid
                 elif prev['Close'] > prev['Middle'] and today['Close'] < today['Middle']:
-                    # Run Instant Backtest
-                    ret_2y, trades_2y = get_strategy_stats(df)
+                    # Note: Backtest results REMOVED for Sell signals to avoid confusion
                     
                     results_sell.append({
                         "Symbol": display_name,
                         "Price": round(today['Close'], 2),
-                        "Signal Date": today.name.strftime('%Y-%m-%d'),
-                        "Total Ret (2Y)": f"{ret_2y}%",
-                        "Trades (2Y)": trades_2y
+                        "Signal Date": today.name.strftime('%Y-%m-%d')
                     })
                     
             except: continue
             
         progress.progress((i + 1) / len(total_chunks))
-        
+    
+    # Sorting Buy Signals by "Most Favorable"
+    # Criteria: Ranking by Backtested Return (High to Low)
+    if results_buy:
+        results_buy.sort(key=lambda x: x['raw_ret'], reverse=True)
+        # Remove raw_ret before display to keep UI clean
+        for item in results_buy:
+            del item['raw_ret']
+
     progress.empty()
     status.empty()
     return results_buy, results_sell
@@ -299,7 +306,14 @@ def deep_dive(ticker):
         ret_2y, trades_2y = get_strategy_stats(df)
         
         is_bullish = curr['Close'] > curr['Middle']
-        status = "BULLISH (Buy Zone)" if is_bullish else "BEARISH (Sell Zone)"
+        
+        # Status Update: Only show "Buy Zone" if Price > Middle. Else show "No Trade Alerts".
+        if is_bullish:
+             status = "BULLISH (Active Buy Signal)"
+             box_color = "buy-signal"
+        else:
+             status = "No Trade Alerts"
+             box_color = "neutral"
         
         df['Buy_X'] = (df['Close'] > df['Middle']) & (df['Close'].shift(1) < df['Middle'].shift(1))
         df['Sell_X'] = (df['Close'] < df['Middle']) & (df['Close'].shift(1) > df['Middle'].shift(1))
@@ -311,6 +325,7 @@ def deep_dive(ticker):
             "name": ticker.replace('.NS', ''),
             "cmp": round(curr['Close'], 2),
             "status": status,
+            "box_color": box_color,
             "is_bullish": is_bullish,
             "buy_date": "-", "buy_price": 0, "pnl": 0.0,
             "sell_date": "-", "sell_price": 0,
@@ -362,12 +377,23 @@ with tab1:
             st.success(f"✅ BUY SIGNALS ({len(st.session_state['buys'])})")
             if st.session_state['buys']:
                 df_b = pd.DataFrame(st.session_state['buys'])
-                st.dataframe(df_b, hide_index=True, use_container_width=True)
                 
-                opts = ["Select to Analyze..."] + df_b['Symbol'].tolist()
-                sel = st.selectbox("Analyze Stock:", opts)
-                if sel != "Select to Analyze...":
-                    st.session_state['analyze_ticker'] = sel
+                # Interactive Dataframe for selection
+                st.caption("👇 Select a row below to analyze in Deep Dive")
+                event = st.dataframe(
+                    df_b, 
+                    hide_index=True, 
+                    use_container_width=True,
+                    on_select="rerun", # Interactive selection
+                    selection_mode="single-row"
+                )
+                
+                # Handle Selection
+                if event.selection.rows:
+                    idx = event.selection.rows[0]
+                    selected_ticker = df_b.iloc[idx]['Symbol']
+                    st.session_state['analyze_ticker'] = selected_ticker
+                    st.info(f"👉 Selected **{selected_ticker}** for Deep Dive. Go to 'Deep Dive' tab.")
 
         with c2:
             st.error(f"❌ SELL SIGNALS ({len(st.session_state['sells'])})")
@@ -383,12 +409,11 @@ with tab2:
         if user_in:
             data, chart = deep_dive(user_in)
             if data:
-                color = "buy-signal" if data['is_bullish'] else "sell-signal"
                 st.markdown(f"""
-                    <div class="metric-box {color}">
+                    <div class="metric-box {data['box_color']}">
                         <h2>{data['name']}</h2>
                         <h3>CMP: {data['cmp']} | {data['status']}</h3>
-                        <p><b>2-Year Strategy Return:</b> {data['ret_2y']}% | <b>Total Trades:</b> {data['trades_2y']}</p>
+                        <p><b>Trades (2Y):</b> {data['trades_2y']} | <b>Total Ret (2Y Backtest):</b> {data['ret_2y']}%</p>
                     </div>
                 """, unsafe_allow_html=True)
                 
