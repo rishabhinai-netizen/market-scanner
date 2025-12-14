@@ -5,7 +5,7 @@ import numpy as np
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(
-    page_title="DC - Created by Rishabh", 
+    page_title="DC Pro - Volume Enhanced", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -41,7 +41,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ DC - Created by Rishabh")
+st.title("⚡ DC Strategy: Volume Enhanced")
 
 # --- 2. ASSET LISTS ---
 COMMODITIES = {
@@ -105,18 +105,29 @@ NSE_500_LIST = [
 
 # --- 3. ANALYTICS ENGINE ---
 def calculate_indicators(df):
-    """Calculates Donchian (20), SMA (200) and RSI (14)"""
+    """
+    Calculates Donchian (20), SMA (200), RSI (14)
+    AND Volume Stats: 7-Day Average Volume (Shifted 1)
+    """
+    # 1. Donchian Channels
     df['High_20'] = df['High'].rolling(20).max()
     df['Low_20'] = df['Low'].rolling(20).min()
     df['Middle'] = (df['High_20'] + df['Low_20']) / 2
+    
+    # 2. Trend & Momentum
     df['SMA_200'] = df['Close'].rolling(200).mean()
     
-    # RSI Calculation
+    # 3. RSI Calculation
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # 4. Volume Metrics (NEW)
+    # We use shift(1) to get the average of the PREVIOUS 7 days, excluding today
+    df['Vol_SMA_7'] = df['Volume'].rolling(7).mean().shift(1)
+    
     return df
 
 def get_strategy_stats(df):
@@ -137,8 +148,7 @@ def get_strategy_stats(df):
     cum_ret = (1 + df['Strat_Ret']).cumprod().iloc[-1] - 1
     total_ret_pct = round(cum_ret * 100, 2)
     
-    # 4. Count Trades (transitions from 0 to 1 or 1 to 0)
-    # We divide by 2 because a full trade is Buy + Sell
+    # 4. Count Trades
     trades = df['Signal_Strat'].diff().abs().sum() / 2
     
     return total_ret_pct, int(trades)
@@ -146,7 +156,6 @@ def get_strategy_stats(df):
 def process_batch(tickers, period="2y"):
     """Downloads batch with AUTO-ADJUST"""
     try:
-        # Fixed to 2y to ensure we always have enough data for backtesting stats
         data = yf.download(tickers, period=period, group_by='ticker', threads=True, progress=False, auto_adjust=True)
         return data
     except Exception:
@@ -154,7 +163,7 @@ def process_batch(tickers, period="2y"):
 
 # --- 4. SCANNER LOGIC ---
 @st.cache_data(ttl=900)
-def run_scan(target_list, use_trend, use_rsi):
+def run_scan(target_list, use_trend, use_rsi, use_vol, vol_multiplier, min_liquidity=10000):
     results_buy = []
     results_sell = []
     
@@ -167,7 +176,6 @@ def run_scan(target_list, use_trend, use_rsi):
         batch = target_list[start_idx : start_idx + chunk_size]
         status.caption(f"Scanning & Backtesting batch {i+1}/{len(total_chunks)}...")
         
-        # Download 2 years data to support on-the-fly backtesting
         data = process_batch(batch, period="2y")
         if data is None or data.empty: continue
         
@@ -184,10 +192,32 @@ def run_scan(target_list, use_trend, use_rsi):
                 
                 display_name = ticker.replace('.NS', '').replace('=F', '')
                 
+                # --- STRATEGY CONDITIONS ---
+                
                 # BUY: Prev < Mid AND Curr > Mid
                 if prev['Close'] < prev['Middle'] and today['Close'] > today['Middle']:
+                    
+                    # 1. Trend Filter
                     if use_trend and today['Close'] < today['SMA_200']: continue
+                    
+                    # 2. RSI Filter
                     if use_rsi and today['RSI'] > 70: continue
+                    
+                    # 3. Volume Filter (NEW)
+                    vol_spike = 0.0
+                    if use_vol:
+                        # Liquidity Check (Skip if avg volume is too low)
+                        if today['Vol_SMA_7'] < min_liquidity: continue
+                        
+                        # Spike Check
+                        if today['Vol_SMA_7'] > 0:
+                            vol_spike = today['Volume'] / today['Vol_SMA_7']
+                        
+                        if vol_spike < vol_multiplier: continue
+                    else:
+                        # Calculate spike anyway for display
+                        if today['Vol_SMA_7'] > 0:
+                            vol_spike = today['Volume'] / today['Vol_SMA_7']
                     
                     # Run Instant Backtest
                     ret_2y, trades_2y = get_strategy_stats(df)
@@ -196,17 +226,15 @@ def run_scan(target_list, use_trend, use_rsi):
                         "Symbol": display_name,
                         "Price": round(today['Close'], 2),
                         "RSI": round(today['RSI'], 1),
+                        "Vol Spike": f"{round(vol_spike, 1)}x", # Display metric
                         "Trend": "⬆️ Uptrend" if today['Close'] > today['SMA_200'] else "⬇️ Weak",
-                        # Backtest result - Raw values used for sorting, strings for display later if needed
                         "raw_ret": ret_2y, 
                         "Trades (2Y)": trades_2y,
-                        "Total Ret (2Y Backtest)": f"{ret_2y}%" # Formatted for display
+                        "Total Ret (2Y Backtest)": f"{ret_2y}%"
                     })
                 
-                # SELL: Prev > Mid AND Curr < Mid
+                # SELL: Prev > Mid AND Curr < Mid (Volume usually ignored for Sells)
                 elif prev['Close'] > prev['Middle'] and today['Close'] < today['Middle']:
-                    # Note: Backtest results REMOVED for Sell signals to avoid confusion
-                    
                     results_sell.append({
                         "Symbol": display_name,
                         "Price": round(today['Close'], 2),
@@ -221,7 +249,7 @@ def run_scan(target_list, use_trend, use_rsi):
     # Criteria: Ranking by Backtested Return (High to Low)
     if results_buy:
         results_buy.sort(key=lambda x: x['raw_ret'], reverse=True)
-        # Remove raw_ret before display to keep UI clean
+        # Remove raw_ret before display
         for item in results_buy:
             del item['raw_ret']
 
@@ -233,8 +261,8 @@ def run_scan(target_list, use_trend, use_rsi):
 @st.cache_data(ttl=3600)
 def run_bulk_backtest(target_list):
     """
-    Scans 2 years of history for ALL stocks.
-    Returns: Profitable List, Loss List
+    Scans 2 years of history for ALL stocks using BASE STRATEGY.
+    (Volume filters are harder to backtest in bulk quickly, so this tests the core logic)
     """
     profitable = []
     loss_making = []
@@ -259,8 +287,6 @@ def run_bulk_backtest(target_list):
                 if len(df) < 200: continue
                 
                 df = calculate_indicators(df)
-                
-                # Reuse helper function
                 total_ret_pct, trades = get_strategy_stats(df)
                 
                 entry = {
@@ -282,9 +308,8 @@ def run_bulk_backtest(target_list):
     progress.empty()
     status.empty()
     
-    # Sort by performance
     profitable.sort(key=lambda x: x['Raw_Ret'], reverse=True)
-    loss_making.sort(key=lambda x: x['Raw_Ret']) # Most negative first
+    loss_making.sort(key=lambda x: x['Raw_Ret']) 
     
     return profitable, loss_making
 
@@ -307,7 +332,11 @@ def deep_dive(ticker):
         
         is_bullish = curr['Close'] > curr['Middle']
         
-        # Status Update: Only show "Buy Zone" if Price > Middle. Else show "No Trade Alerts".
+        # Calculate Volume Spike for current candle
+        vol_spike = 0.0
+        if curr['Vol_SMA_7'] > 0:
+            vol_spike = round(curr['Volume'] / curr['Vol_SMA_7'], 2)
+        
         if is_bullish:
              status = "BULLISH (Active Buy Signal)"
              box_color = "buy-signal"
@@ -330,7 +359,8 @@ def deep_dive(ticker):
             "buy_date": "-", "buy_price": 0, "pnl": 0.0,
             "sell_date": "-", "sell_price": 0,
             "ret_2y": ret_2y,
-            "trades_2y": trades_2y
+            "trades_2y": trades_2y,
+            "curr_vol_spike": f"{vol_spike}x"
         }
         
         if not last_buy.empty:
@@ -349,25 +379,38 @@ def deep_dive(ticker):
 # --- 6. UI LAYOUT ---
 # Mobile Optimization: Controls moved to Main Page Expander
 with st.expander("⚙️ Scanner Settings & Controls", expanded=True):
-    c1, c2, c3 = st.columns([1,1,1])
-    with c1:
-        market = st.radio("Select Market", ["NSE 500 (Full)", "Commodities"])
-    with c2:
-        st.caption("Filters")
-        trend_filter = st.checkbox("Trend Filter (>200 SMA)", True)
-        rsi_filter = st.checkbox("RSI Filter (<70)", True)
-    with c3:
-        st.write("")
-        st.write("")
-        run_btn = st.button("RUN SCANNER", type="primary")
+    # Top Row: Market Selection & Run
+    c_top1, c_top2 = st.columns([2,1])
+    with c_top1:
+        market = st.radio("Select Market", ["NSE 500 (Full)", "Commodities"], horizontal=True)
+    with c_top2:
+        run_btn = st.button("🚀 RUN SCANNER", type="primary")
+
+    st.markdown("---")
+    
+    # Bottom Row: Filters (3 Columns)
+    f1, f2, f3 = st.columns(3)
+    
+    with f1:
+        st.write("#### 1. Trend & Momentum")
+        trend_filter = st.checkbox("✅ Trend Filter (>200 SMA)", True)
+        rsi_filter = st.checkbox("✅ RSI Filter (<70)", True)
+        
+    with f2:
+        st.write("#### 2. Volume Expansion (New)")
+        use_vol = st.checkbox("✅ Enable Volume Filter", True)
+        vol_multiplier = st.slider("Min Volume Spike (x)", 1.5, 5.0, 2.5, 0.1, help="Current Vol vs 7-Day Avg")
+        
+    with f3:
+        st.info(f"**Filter Logic:**\n\nBuy IF:\n1. Price Crosses > Middle Band\n2. Vol > {vol_multiplier}x Avg (7 Days)\n3. Price > 200 SMA (Optional)")
 
 tab1, tab2, tab3 = st.tabs(["🚀 Market Scanner", "🔍 Deep Dive", "📊 Bulk Backtest"])
 
 with tab1:
     if run_btn:
         t_list = NSE_500_LIST if market == "NSE 500 (Full)" else list(COMMODITIES.values())
-        with st.spinner("Scanning & Calculating 2-Year Returns..."):
-            buys, sells = run_scan(t_list, trend_filter, rsi_filter)
+        with st.spinner(f"Scanning with Volume Filter (> {vol_multiplier}x)..."):
+            buys, sells = run_scan(t_list, trend_filter, rsi_filter, use_vol, vol_multiplier)
             st.session_state['buys'] = buys
             st.session_state['sells'] = sells
         
@@ -384,11 +427,10 @@ with tab1:
                     df_b, 
                     hide_index=True, 
                     use_container_width=True,
-                    on_select="rerun", # Interactive selection
+                    on_select="rerun", 
                     selection_mode="single-row"
                 )
                 
-                # Handle Selection
                 if event.selection.rows:
                     idx = event.selection.rows[0]
                     selected_ticker = df_b.iloc[idx]['Symbol']
@@ -413,7 +455,7 @@ with tab2:
                     <div class="metric-box {data['box_color']}">
                         <h2>{data['name']}</h2>
                         <h3>CMP: {data['cmp']} | {data['status']}</h3>
-                        <p><b>Trades (2Y):</b> {data['trades_2y']} | <b>Total Ret (2Y Backtest):</b> {data['ret_2y']}%</p>
+                        <p><b>Vol Spike:</b> {data['curr_vol_spike']} | <b>Trades (2Y):</b> {data['trades_2y']} | <b>Total Ret (2Y):</b> {data['ret_2y']}%</p>
                     </div>
                 """, unsafe_allow_html=True)
                 
@@ -422,8 +464,6 @@ with tab2:
                 m2.metric("Last Sell Signal", f"{data['sell_date']}", f"@{data['sell_price']}")
                 m3.metric("Current P&L", f"{data['pnl']}%")
                 
-                # Chart removed as requested
-                st.info("Chart removed to focus on data.")
             else: st.error("Stock not found.")
 
 with tab3:
@@ -435,19 +475,17 @@ with tab3:
     if st.button("RUN BULK BACKTEST", type="primary"):
         t_list = NSE_500_LIST if backtest_market == "NSE 500 (Full)" else list(COMMODITIES.values())
         
-        with st.spinner("Crunching 2 years of data for all stocks... (60-90s)"):
+        with st.spinner("Crunching 2 years of data... (60-90s)"):
             prof, loss = run_bulk_backtest(t_list)
             
             col_a, col_b = st.columns(2)
             
             with col_a:
                 st.success(f"🏆 Profitable Stocks ({len(prof)})")
-                st.caption("Stocks where this strategy made money")
                 if prof:
                     st.dataframe(pd.DataFrame(prof).drop(columns=['Raw_Ret']), use_container_width=True, hide_index=True)
             
             with col_b:
                 st.error(f"⚠️ Loss Making Stocks ({len(loss)})")
-                st.caption("Stocks where this strategy lost money")
                 if loss:
                     st.dataframe(pd.DataFrame(loss).drop(columns=['Raw_Ret']), use_container_width=True, hide_index=True)
