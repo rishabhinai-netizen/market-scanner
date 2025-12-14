@@ -23,6 +23,7 @@ st.markdown("""
             padding: 15px; border-radius: 8px; text-align: center; margin-bottom: 10px; border: 1px solid #ddd; 
         }
         .buy-signal { background-color: #d4edda; color: #155724; border-color: #c3e6cb; }
+        .sell-signal { background-color: #f8d7da; color: #721c24; border-color: #f5c6cb; }
         .neutral { background-color: #f8f9fa; color: #666; }
     </style>
 """, unsafe_allow_html=True)
@@ -35,6 +36,7 @@ COMMODITIES = {
     'Crude Oil': 'CL=F', 'Natural Gas': 'NG=F'
 }
 
+# FULL NSE 500 LIST (Restored)
 NSE_500_LIST = [
     'M&MFIN.NS', 'RCF.NS', 'PATANJALI.NS', 'SBICARD.NS', 'SUNDARMFIN.NS', 'PTCIL.NS', 'INDUSTOWER.NS', 'CHOLAFIN.NS', 'LTF.NS', 'SKFINDUS.NS',
     'SHRIRAMFIN.NS', 'MARICO.NS', 'DEEPAKNTR.NS', 'ABCAPITAL.NS', 'SBIN.NS', 'PNBHOUSING.NS', 'MUTHOOTFIN.NS', 'RBLBANK.NS', 'POLICYBZR.NS', 'LLOYDSME.NS',
@@ -99,9 +101,10 @@ def calculate_indicators(df):
     df['Low_20'] = df['Low'].rolling(20).min()
     df['Middle'] = (df['High_20'] + df['Low_20']) / 2
     
-    # 2. Trend & MA (Shared)
+    # 2. Trend Indicators (For Strategy 2 - Trend Surfer)
     df['SMA_200'] = df['Close'].rolling(200).mean()
-    df['SMA_5'] = df['Close'].rolling(5).mean() # For Mean Reversion Exit
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     
     # 3. RSI 14 (For Strategy 1)
     delta = df['Close'].diff()
@@ -110,21 +113,15 @@ def calculate_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # 4. RSI 2 (For Strategy 2 - Mean Reversion)
-    gain_2 = (delta.where(delta > 0, 0)).rolling(2).mean()
-    loss_2 = (-delta.where(delta < 0, 0)).rolling(2).mean()
-    rs_2 = gain_2 / loss_2
-    df['RSI_2'] = 100 - (100 / (1 + rs_2))
-    
-    # 5. Volume Stats (For Strategy 1)
+    # 4. Volume Stats (For Strategy 1)
     df['Vol_SMA_7'] = df['Volume'].rolling(7).mean().shift(1)
     
     return df
 
-# --- 4. BACKTEST ENGINES (Strategy Specific) ---
+# --- 4. BACKTEST ENGINES ---
 
 def get_dc_stats(df, use_vol=False, vol_multiplier=2.5, min_liquidity=0):
-    """STRATEGY 1: Donchian Breakout Backtest"""
+    """STRATEGY 1: Donchian Breakout"""
     prev_close = df['Close'].shift(1)
     prev_mid = df['Middle'].shift(1)
     
@@ -150,33 +147,53 @@ def get_dc_stats(df, use_vol=False, vol_multiplier=2.5, min_liquidity=0):
     
     return round(cum_ret * 100, 2), int(trades)
 
-def get_mr_stats(df, rsi_entry=10):
-    """STRATEGY 2: Mean Reversion (Dip Snap) Backtest"""
-    # Logic: 
-    # Buy IF: Close > SMA 200 (Uptrend) AND RSI_2 < Threshold (Panic)
-    # Sell IF: Close > SMA 5 (Snap back)
+def get_trend_surfer_stats(df, stop_loss_pct=7.0):
+    """STRATEGY 2: Trend Surfer (EMA 20/50 + Stop Loss)"""
+    # Logic:
+    # Entry: Close > EMA 20 AND Close > EMA 50
+    # Stop Loss: Fixed % from Entry Price
+    # Exit: Close < EMA 20 (Trend ends)
     
-    # 1. Define Conditions
-    is_uptrend = df['Close'] > df['SMA_200']
-    is_panic = df['RSI_2'] < rsi_entry
+    in_position = False
+    entry_price = 0.0
+    capital = 10000.0 
+    balance = capital
+    trades_count = 0
     
-    entry_signal = is_uptrend & is_panic
-    exit_signal = df['Close'] > df['SMA_5']
-    
-    # 2. Vectorized Latch (State Machine)
-    actions = pd.Series(np.nan, index=df.index)
-    actions.loc[entry_signal] = 1 # Enter
-    actions.loc[exit_signal] = 0  # Exit
-    
-    # Fill NaN: If no signal today, keep previous state (Hold or Flat)
-    df['Signal'] = actions.ffill().fillna(0).shift(1) # Enter next day
-    
-    # 3. Calc Returns
-    df['Strat_Ret'] = df['Close'].pct_change() * df['Signal']
-    cum_ret = (1 + df['Strat_Ret']).cumprod().iloc[-1] - 1
-    trades = df['Signal'].diff().abs().sum() / 2
-    
-    return round(cum_ret * 100, 2), int(trades)
+    # Simulation Loop (Required for Stop Loss logic)
+    # We loop through valid data (after indicators populate)
+    valid_start = 50 
+    if len(df) < valid_start: return 0.0, 0
+
+    for i in range(valid_start, len(df)):
+        close = df['Close'].iloc[i]
+        low = df['Low'].iloc[i]
+        ema_20 = df['EMA_20'].iloc[i]
+        ema_50 = df['EMA_50'].iloc[i]
+        
+        if in_position:
+            # 1. STOP LOSS CHECK
+            stop_price = entry_price * (1 - stop_loss_pct/100)
+            if low < stop_price:
+                # Stopped Out
+                balance = balance * (1 + (stop_price - entry_price)/entry_price)
+                in_position = False
+                trades_count += 1
+            
+            # 2. TREND EXIT CHECK
+            elif close < ema_20:
+                balance = balance * (1 + (close - entry_price)/entry_price)
+                in_position = False
+                trades_count += 1
+        
+        else:
+            # ENTRY CHECK
+            if close > ema_20 and close > ema_50:
+                in_position = True
+                entry_price = close
+
+    total_return = ((balance - capital) / capital) * 100
+    return round(total_return, 2), int(trades_count)
 
 def process_batch(tickers, period="2y"):
     try:
@@ -206,7 +223,7 @@ def run_master_scan(strategy_type, target_list, params):
                 df = data[ticker] if len(batch) > 1 else data.copy()
                 if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                 df = df.dropna()
-                if len(df) < 200: continue # Need 200 SMA
+                if len(df) < 200: continue
                 
                 df = calculate_indicators(df)
                 today = df.iloc[-1]
@@ -219,7 +236,6 @@ def run_master_scan(strategy_type, target_list, params):
                     # Check Live Entry
                     is_cross = (prev['Close'] < prev['Middle']) and (today['Close'] > today['Middle'])
                     if is_cross:
-                        # Filters
                         if params['trend'] and today['Close'] < today['SMA_200']: continue
                         if params['rsi'] and today['RSI'] > 70: continue
                         
@@ -230,7 +246,6 @@ def run_master_scan(strategy_type, target_list, params):
                             if today['Vol_SMA_7'] < params['min_liq']: continue
                             if vol_spike < params['vol_mult']: continue
                         
-                        # Backtest
                         ret, trades = get_dc_stats(df, params['use_vol'], params['vol_mult'], params['min_liq'])
                         
                         results.append({
@@ -239,18 +254,18 @@ def run_master_scan(strategy_type, target_list, params):
                             "Trades (2Y)": trades, "Ret (2Y)": f"{ret}%", "raw_ret": ret
                         })
 
-                elif strategy_type == "Mean Reversion":
-                    # Check Live Entry: Uptrend + Panic RSI
-                    is_uptrend = today['Close'] > today['SMA_200']
-                    is_panic = today['RSI_2'] < params['rsi_entry']
+                elif strategy_type == "Trend Surfer":
+                    # Check Live Entry: Trend Strong
+                    # Logic: Close > EMA 20 & 50
+                    is_uptrend = (today['Close'] > today['EMA_20']) and (today['Close'] > today['EMA_50'])
                     
-                    if is_uptrend and is_panic:
-                        # Backtest
-                        ret, trades = get_mr_stats(df, params['rsi_entry'])
+                    if is_uptrend:
+                        # Backtest with Stop Loss
+                        ret, trades = get_trend_surfer_stats(df, params['stop_loss'])
                         
                         results.append({
                             "Symbol": display_name, "Price": round(today['Close'], 2),
-                            "Signal": "Dip Buy", "RSI(2)": round(today['RSI_2'], 1),
+                            "Signal": "Trend Strong", 
                             "Trades (2Y)": trades, "Ret (2Y)": f"{ret}%", "raw_ret": ret
                         })
                         
@@ -287,8 +302,8 @@ def run_bulk_test(strategy_type, target_list, params):
                 
                 if strategy_type == "Donchian Breakout":
                     ret, trades = get_dc_stats(df, params['use_vol'], params['vol_mult'], params['min_liq'])
-                else:
-                    ret, trades = get_mr_stats(df, params['rsi_entry'])
+                else: # Trend Surfer
+                    ret, trades = get_trend_surfer_stats(df, params['stop_loss'])
                 
                 entry = {
                     "Symbol": ticker.replace('.NS', ''), "Total Return": f"{ret}%",
@@ -325,7 +340,6 @@ def deep_dive_chart(ticker, strategy_type, params):
         if strategy_type == "Donchian Breakout":
             ret, trades = get_dc_stats(df, params['use_vol'], params['vol_mult'])
             
-            # Live Status Logic
             is_bullish = curr['Close'] > curr['Middle']
             if is_bullish:
                 res["status"] = "BULLISH (Above Mid Band)"
@@ -333,23 +347,17 @@ def deep_dive_chart(ticker, strategy_type, params):
             
             res.update({"ret": ret, "trades": trades, "info": f"Vol Spike: {round(curr['Volume']/curr['Vol_SMA_7'], 1)}x" if curr['Vol_SMA_7'] > 0 else "N/A"})
             
-        else: # Mean Reversion
-            ret, trades = get_mr_stats(df, params['rsi_entry'])
+        else: # Trend Surfer
+            ret, trades = get_trend_surfer_stats(df, params['stop_loss'])
             
-            # Live Status Logic
-            in_trade = (curr['Close'] > curr['SMA_200']) and (curr['Close'] < curr['SMA_5']) # Holding
-            can_buy = (curr['Close'] > curr['SMA_200']) and (curr['RSI_2'] < params['rsi_entry'])
-            
-            if can_buy:
-                res["status"] = "BUY SIGNAL (Panic Dip)"
+            is_uptrend = (curr['Close'] > curr['EMA_20']) and (curr['Close'] > curr['EMA_50'])
+            if is_uptrend:
+                res["status"] = "RIDING TREND (Price > EMA 20 & 50)"
                 res["box_color"] = "buy-signal"
-            elif in_trade:
-                res["status"] = "HOLD (Waiting for Snap)"
-                res["box_color"] = "neutral"
             else:
-                res["status"] = "NO SIGNAL"
+                res["status"] = "NO SIGNAL / EXIT"
                 
-            res.update({"ret": ret, "trades": trades, "info": f"RSI(2): {round(curr['RSI_2'], 1)}"})
+            res.update({"ret": ret, "trades": trades, "info": f"EMA 20: {round(curr['EMA_20'], 1)}"})
 
         return res
     except: return None
@@ -359,8 +367,8 @@ def deep_dive_chart(ticker, strategy_type, params):
 # SIDEBAR: Strategy Selector
 with st.sidebar:
     st.header("🎮 Strategy Control")
-    strat_mode = st.radio("Select Engine", ["Donchian Breakout", "Mean Reversion"], 
-                          help="Donchian: Trend Following | Mean Reversion: Dip Buying")
+    strat_mode = st.radio("Select Engine", ["Donchian Breakout", "Trend Surfer"], 
+                          help="Donchian: Breakout (Bull Market) | Trend Surfer: EMA Trend + Stop Loss")
     
     params = {}
     st.divider()
@@ -373,13 +381,13 @@ with st.sidebar:
         params['use_vol'] = st.checkbox("Volume Spike Filter", True)
         params['vol_mult'] = st.slider("Min Vol Spike (x)", 1.5, 5.0, 2.5)
         params['min_liq'] = 10000
-        st.info("Best for: Strong Bull Markets")
+        st.info("Strategy: Buy Breakouts of 20-Day High")
         
-    else: # Mean Reversion
-        st.subheader("🧲 Mean Reversion Settings")
-        st.caption("Strategy: Buy Uptrend Dips, Sell Snaps")
-        params['rsi_entry'] = st.slider("Entry: RSI(2) Below", 2, 25, 10, help="Lower = More Extreme Panic")
-        st.info("Best for: Choppy/Volatile Markets")
+    else: # Trend Surfer
+        st.subheader("🏄 Trend Surfer Settings")
+        st.caption("Strategy: EMA Crossover + Hard Stop Loss")
+        params['stop_loss'] = st.slider("Stop Loss %", 3.0, 15.0, 7.0, 0.5, help="Exits if price drops X% from entry")
+        st.info("Entry: Close > EMA 20 & 50\nExit: Close < EMA 20\nSafety: Stop Loss Active")
 
 # MAIN PAGE
 with st.expander("🚀 Scanner Controls", expanded=True):
