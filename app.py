@@ -146,8 +146,6 @@ def calculate_indicators(df, nifty_roc=None):
 
 def get_dc_stats(df, params):
     """STRATEGY 1: Donchian Breakout"""
-    # Logic: Buy if Price > Middle AND RS Pass (if enabled)
-    
     prev_close = df['Close'].shift(1)
     prev_mid = df['Middle'].shift(1)
     
@@ -216,8 +214,6 @@ def get_trend_surfer_stats(df, params):
         
         else:
             # ENTRY CHECK
-            # Base: Close > EMA 20 & 50
-            # Filter: RS must be passing (if enabled)
             trend_ok = close > ema_20 and close > ema_50
             rs_ok = rs_pass if use_rs else True
             
@@ -237,7 +233,8 @@ def process_batch(tickers, period="2y"):
 # --- 5. MASTER SCANNER ---
 @st.cache_data(ttl=900)
 def run_master_scan(strategy_type, target_list, params, nifty_roc):
-    results = []
+    results_buy = []
+    results_sell = []
     
     chunk_size = 30
     total_chunks = range(0, len(target_list), chunk_size)
@@ -265,58 +262,77 @@ def run_master_scan(strategy_type, target_list, params, nifty_roc):
                 prev = df.iloc[-2]
                 display_name = ticker.replace('.NS', '').replace('=F', '')
                 
-                # RS Check (Live Scanner Filter)
-                if params['use_rs'] and not today['RS_Pass']:
-                    continue
+                # RS Check (Live Scanner Filter for BUYS only)
+                rs_valid = today['RS_Pass'] if params['use_rs'] else True
                 
                 # --- STRATEGY BRANCHING ---
                 
                 if strategy_type == "Donchian Breakout":
-                    is_cross = (prev['Close'] < prev['Middle']) and (today['Close'] > today['Middle'])
+                    # BUY SIGNAL
+                    is_cross_up = (prev['Close'] < prev['Middle']) and (today['Close'] > today['Middle'])
                     
-                    if is_cross:
-                        if params['trend'] and today['Close'] < today['SMA_200']: continue
-                        if params['rsi'] and today['RSI'] > 70: continue
-                        
-                        vol_spike = 0.0
-                        if today['Vol_SMA_7'] > 0: vol_spike = today['Volume'] / today['Vol_SMA_7']
-                        
-                        if params['use_vol']:
-                            if today['Vol_SMA_7'] < params['min_liq']: continue
-                            if vol_spike < params['vol_mult']: continue
-                        
-                        # Backtest
-                        ret, trades = get_dc_stats(df, params)
-                        
-                        results.append({
+                    if is_cross_up and rs_valid:
+                        if params['trend'] and today['Close'] < today['SMA_200']: pass
+                        elif params['rsi'] and today['RSI'] > 70: pass
+                        else:
+                            vol_spike = 0.0
+                            if today['Vol_SMA_7'] > 0: vol_spike = today['Volume'] / today['Vol_SMA_7']
+                            
+                            valid_vol = True
+                            if params['use_vol']:
+                                if today['Vol_SMA_7'] < params['min_liq']: valid_vol = False
+                                if vol_spike < params['vol_mult']: valid_vol = False
+                            
+                            if valid_vol:
+                                ret, trades = get_dc_stats(df, params)
+                                results_buy.append({
+                                    "Symbol": display_name, "Price": round(today['Close'], 2),
+                                    "Signal": "Breakout", "Vol Spike": f"{round(vol_spike, 1)}x",
+                                    "Trades (2Y)": trades, "Ret (2Y)": f"{ret}%", "raw_ret": ret
+                                })
+
+                    # SELL SIGNAL (Cross Down)
+                    is_cross_down = (prev['Close'] > prev['Middle']) and (today['Close'] < today['Middle'])
+                    if is_cross_down:
+                        results_sell.append({
                             "Symbol": display_name, "Price": round(today['Close'], 2),
-                            "Signal": "Breakout", "Vol Spike": f"{round(vol_spike, 1)}x",
-                            "Trades (2Y)": trades, "Ret (2Y)": f"{ret}%", "raw_ret": ret
+                            "Signal": "Cross Below Mid"
                         })
 
                 elif strategy_type == "Trend Surfer":
+                    # BUY SIGNAL
                     is_uptrend = (today['Close'] > today['EMA_20']) and (today['Close'] > today['EMA_50'])
                     
-                    if is_uptrend:
-                        # Backtest
+                    if is_uptrend and rs_valid:
                         ret, trades = get_trend_surfer_stats(df, params)
-                        
-                        results.append({
+                        results_buy.append({
                             "Symbol": display_name, "Price": round(today['Close'], 2),
                             "Signal": "Trend Strong", "RS": "Strong" if today['RS_Pass'] else "Weak",
                             "Trades (2Y)": trades, "Ret (2Y)": f"{ret}%", "raw_ret": ret
+                        })
+                    
+                    # SELL SIGNAL (Trend Bends)
+                    # Logic: Close < EMA 20 (Exit Condition)
+                    trend_broken = today['Close'] < today['EMA_20']
+                    # To reduce noise, only show if it WAS valid yesterday
+                    was_uptrend = prev['Close'] > prev['EMA_20']
+                    
+                    if trend_broken and was_uptrend:
+                        results_sell.append({
+                            "Symbol": display_name, "Price": round(today['Close'], 2),
+                            "Signal": "Trend Broken (< EMA 20)"
                         })
                         
             except: continue
         progress.progress((i + 1) / len(total_chunks))
     
-    if results:
-        results.sort(key=lambda x: x['raw_ret'], reverse=True)
-        for item in results: del item['raw_ret']
+    if results_buy:
+        results_buy.sort(key=lambda x: x['raw_ret'], reverse=True)
+        for item in results_buy: del item['raw_ret']
         
     progress.empty()
     status.empty()
-    return results
+    return results_buy, results_sell
 
 @st.cache_data(ttl=3600)
 def run_bulk_test(strategy_type, target_list, params, nifty_roc):
@@ -443,16 +459,30 @@ with tab1:
     if run_btn:
         t_list = NSE_500_LIST if market == "NSE 500" else list(COMMODITIES.values())
         with st.spinner(f"Running {strat_mode} Engine (RS={use_rs})..."):
-            results = run_master_scan(strat_mode, t_list, params, nifty_roc)
-            st.session_state['scan_res'] = results
+            results_buy, results_sell = run_master_scan(strat_mode, t_list, params, nifty_roc)
+            st.session_state['scan_res_buy'] = results_buy
+            st.session_state['scan_res_sell'] = results_sell
             
-    if 'scan_res' in st.session_state:
-        df_res = pd.DataFrame(st.session_state['scan_res'])
-        if not df_res.empty:
-            st.success(f"✅ FOUND {len(df_res)} SIGNALS")
-            st.dataframe(df_res, hide_index=True, use_container_width=True)
-        else:
-            st.warning("No stocks matched criteria today.")
+    # Display Buy/Sell Columns
+    c_buy, c_sell = st.columns(2)
+    
+    with c_buy:
+        if 'scan_res_buy' in st.session_state:
+            df_buy = pd.DataFrame(st.session_state['scan_res_buy'])
+            st.success(f"✅ BUY SIGNALS ({len(df_buy)})")
+            if not df_buy.empty:
+                st.dataframe(df_buy, hide_index=True, use_container_width=True)
+            else:
+                st.info("No Buy Signals Found")
+                
+    with c_sell:
+        if 'scan_res_sell' in st.session_state:
+            df_sell = pd.DataFrame(st.session_state['scan_res_sell'])
+            st.error(f"❌ SELL / EXIT SIGNALS ({len(df_sell)})")
+            if not df_sell.empty:
+                st.dataframe(df_sell, hide_index=True, use_container_width=True)
+            else:
+                st.info("No Sell Signals Found")
 
 with tab2:
     st.header("Deep Dive Analysis")
