@@ -36,7 +36,7 @@ COMMODITIES = {
     'Crude Oil': 'CL=F', 'Natural Gas': 'NG=F'
 }
 
-# FULL NSE 500 LIST (Restored)
+# FULL NSE 500 LIST
 NSE_500_LIST = [
     'M&MFIN.NS', 'RCF.NS', 'PATANJALI.NS', 'SBICARD.NS', 'SUNDARMFIN.NS', 'PTCIL.NS', 'INDUSTOWER.NS', 'CHOLAFIN.NS', 'LTF.NS', 'SKFINDUS.NS',
     'SHRIRAMFIN.NS', 'MARICO.NS', 'DEEPAKNTR.NS', 'ABCAPITAL.NS', 'SBIN.NS', 'PNBHOUSING.NS', 'MUTHOOTFIN.NS', 'RBLBANK.NS', 'POLICYBZR.NS', 'LLOYDSME.NS',
@@ -91,50 +91,81 @@ NSE_500_LIST = [
     'KAYNES.NS'
 ]
 
-# --- 3. CORE ANALYTICS ENGINE (Shared) ---
-def calculate_indicators(df):
+# --- 3. DATA & ANALYTICS ENGINE ---
+
+@st.cache_data(ttl=3600)
+def fetch_nifty_data(period="2y"):
+    """Downloads Nifty 50 for Relative Strength Calculation"""
+    try:
+        nifty = yf.download("^NSEI", period=period, progress=False, auto_adjust=True)
+        # Calculate 55-Day ROC (Rate of Change) (~3 Months)
+        nifty['ROC_55'] = nifty['Close'].pct_change(periods=55) * 100
+        return nifty['ROC_55']
+    except:
+        return None
+
+def calculate_indicators(df, nifty_roc=None):
     """
-    Calculates ALL indicators needed for BOTH strategies in one pass.
+    Calculates indicators + Relative Strength (RS)
     """
-    # 1. Donchian (For Strategy 1)
+    # 1. Donchian (Strategy 1)
     df['High_20'] = df['High'].rolling(20).max()
     df['Low_20'] = df['Low'].rolling(20).min()
     df['Middle'] = (df['High_20'] + df['Low_20']) / 2
     
-    # 2. Trend Indicators (For Strategy 2 - Trend Surfer)
+    # 2. Trend Surfer (Strategy 2)
     df['SMA_200'] = df['Close'].rolling(200).mean()
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     
-    # 3. RSI 14 (For Strategy 1)
+    # 3. Common Indicators
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # 4. Volume Stats (For Strategy 1)
     df['Vol_SMA_7'] = df['Volume'].rolling(7).mean().shift(1)
     
+    # 4. Relative Strength (RS) Engine
+    if nifty_roc is not None:
+        # Calculate Stock ROC
+        df['Stock_ROC_55'] = df['Close'].pct_change(periods=55) * 100
+        
+        # Map Nifty ROC to Stock Dates (Align Indexes)
+        df['Nifty_ROC'] = nifty_roc.reindex(df.index).ffill()
+        
+        # RS Condition: Stock Performance > Nifty Performance
+        df['RS_Pass'] = df['Stock_ROC_55'] > df['Nifty_ROC']
+    else:
+        df['RS_Pass'] = True # Default to True if Nifty data fails
+        
     return df
 
 # --- 4. BACKTEST ENGINES ---
 
-def get_dc_stats(df, use_vol=False, vol_multiplier=2.5, min_liquidity=0):
+def get_dc_stats(df, params):
     """STRATEGY 1: Donchian Breakout"""
+    # Logic: Buy if Price > Middle AND RS Pass (if enabled)
+    
     prev_close = df['Close'].shift(1)
     prev_mid = df['Middle'].shift(1)
     
-    # Entry: Cross Up
+    # Base Signal
     cross_up = (df['Close'] > df['Middle']) & (prev_close < prev_mid)
-    # Exit: Cross Down
     cross_down = (df['Close'] < df['Middle']) & (prev_close > prev_mid)
     
     entry_signal = cross_up.copy()
-    if use_vol:
-        vol_cond = (df['Volume'] > vol_multiplier * df['Vol_SMA_7']) & (df['Vol_SMA_7'] > min_liquidity)
+    
+    # Filters
+    if params['use_vol']:
+        vol_cond = (df['Volume'] > params['vol_mult'] * df['Vol_SMA_7']) & (df['Vol_SMA_7'] > params['min_liq'])
         entry_signal = entry_signal & vol_cond
+        
+    if params['use_rs']:
+        entry_signal = entry_signal & df['RS_Pass']
 
+    # Simulation
     actions = pd.Series(np.nan, index=df.index)
     actions.loc[entry_signal] = 1 
     actions.loc[cross_down] = 0   
@@ -147,12 +178,11 @@ def get_dc_stats(df, use_vol=False, vol_multiplier=2.5, min_liquidity=0):
     
     return round(cum_ret * 100, 2), int(trades)
 
-def get_trend_surfer_stats(df, stop_loss_pct=7.0):
-    """STRATEGY 2: Trend Surfer (EMA 20/50 + Stop Loss)"""
-    # Logic:
-    # Entry: Close > EMA 20 AND Close > EMA 50
-    # Stop Loss: Fixed % from Entry Price
-    # Exit: Close < EMA 20 (Trend ends)
+def get_trend_surfer_stats(df, params):
+    """STRATEGY 2: Trend Surfer (EMA + Stop Loss)"""
+    
+    stop_loss_pct = params['stop_loss']
+    use_rs = params['use_rs']
     
     in_position = False
     entry_price = 0.0
@@ -160,9 +190,7 @@ def get_trend_surfer_stats(df, stop_loss_pct=7.0):
     balance = capital
     trades_count = 0
     
-    # Simulation Loop (Required for Stop Loss logic)
-    # We loop through valid data (after indicators populate)
-    valid_start = 50 
+    valid_start = 55 # Need ROC data
     if len(df) < valid_start: return 0.0, 0
 
     for i in range(valid_start, len(df)):
@@ -170,17 +198,17 @@ def get_trend_surfer_stats(df, stop_loss_pct=7.0):
         low = df['Low'].iloc[i]
         ema_20 = df['EMA_20'].iloc[i]
         ema_50 = df['EMA_50'].iloc[i]
+        rs_pass = df['RS_Pass'].iloc[i]
         
         if in_position:
-            # 1. STOP LOSS CHECK
+            # 1. STOP LOSS
             stop_price = entry_price * (1 - stop_loss_pct/100)
             if low < stop_price:
-                # Stopped Out
                 balance = balance * (1 + (stop_price - entry_price)/entry_price)
                 in_position = False
                 trades_count += 1
             
-            # 2. TREND EXIT CHECK
+            # 2. TREND EXIT
             elif close < ema_20:
                 balance = balance * (1 + (close - entry_price)/entry_price)
                 in_position = False
@@ -188,7 +216,12 @@ def get_trend_surfer_stats(df, stop_loss_pct=7.0):
         
         else:
             # ENTRY CHECK
-            if close > ema_20 and close > ema_50:
+            # Base: Close > EMA 20 & 50
+            # Filter: RS must be passing (if enabled)
+            trend_ok = close > ema_20 and close > ema_50
+            rs_ok = rs_pass if use_rs else True
+            
+            if trend_ok and rs_ok:
                 in_position = True
                 entry_price = close
 
@@ -203,7 +236,7 @@ def process_batch(tickers, period="2y"):
 
 # --- 5. MASTER SCANNER ---
 @st.cache_data(ttl=900)
-def run_master_scan(strategy_type, target_list, params):
+def run_master_scan(strategy_type, target_list, params, nifty_roc):
     results = []
     
     chunk_size = 30
@@ -225,16 +258,22 @@ def run_master_scan(strategy_type, target_list, params):
                 df = df.dropna()
                 if len(df) < 200: continue
                 
-                df = calculate_indicators(df)
+                # Pass Nifty ROC for RS Calculation
+                df = calculate_indicators(df, nifty_roc)
+                
                 today = df.iloc[-1]
                 prev = df.iloc[-2]
                 display_name = ticker.replace('.NS', '').replace('=F', '')
                 
+                # RS Check (Live Scanner Filter)
+                if params['use_rs'] and not today['RS_Pass']:
+                    continue
+                
                 # --- STRATEGY BRANCHING ---
                 
                 if strategy_type == "Donchian Breakout":
-                    # Check Live Entry
                     is_cross = (prev['Close'] < prev['Middle']) and (today['Close'] > today['Middle'])
+                    
                     if is_cross:
                         if params['trend'] and today['Close'] < today['SMA_200']: continue
                         if params['rsi'] and today['RSI'] > 70: continue
@@ -246,7 +285,8 @@ def run_master_scan(strategy_type, target_list, params):
                             if today['Vol_SMA_7'] < params['min_liq']: continue
                             if vol_spike < params['vol_mult']: continue
                         
-                        ret, trades = get_dc_stats(df, params['use_vol'], params['vol_mult'], params['min_liq'])
+                        # Backtest
+                        ret, trades = get_dc_stats(df, params)
                         
                         results.append({
                             "Symbol": display_name, "Price": round(today['Close'], 2),
@@ -255,17 +295,15 @@ def run_master_scan(strategy_type, target_list, params):
                         })
 
                 elif strategy_type == "Trend Surfer":
-                    # Check Live Entry: Trend Strong
-                    # Logic: Close > EMA 20 & 50
                     is_uptrend = (today['Close'] > today['EMA_20']) and (today['Close'] > today['EMA_50'])
                     
                     if is_uptrend:
-                        # Backtest with Stop Loss
-                        ret, trades = get_trend_surfer_stats(df, params['stop_loss'])
+                        # Backtest
+                        ret, trades = get_trend_surfer_stats(df, params)
                         
                         results.append({
                             "Symbol": display_name, "Price": round(today['Close'], 2),
-                            "Signal": "Trend Strong", 
+                            "Signal": "Trend Strong", "RS": "Strong" if today['RS_Pass'] else "Weak",
                             "Trades (2Y)": trades, "Ret (2Y)": f"{ret}%", "raw_ret": ret
                         })
                         
@@ -281,7 +319,7 @@ def run_master_scan(strategy_type, target_list, params):
     return results
 
 @st.cache_data(ttl=3600)
-def run_bulk_test(strategy_type, target_list, params):
+def run_bulk_test(strategy_type, target_list, params, nifty_roc):
     prof, loss = [], []
     chunk_size = 50
     chunks = range(0, len(target_list), chunk_size)
@@ -298,12 +336,13 @@ def run_bulk_test(strategy_type, target_list, params):
                 if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                 df = df.dropna()
                 if len(df) < 200: continue
-                df = calculate_indicators(df)
+                
+                df = calculate_indicators(df, nifty_roc)
                 
                 if strategy_type == "Donchian Breakout":
-                    ret, trades = get_dc_stats(df, params['use_vol'], params['vol_mult'], params['min_liq'])
-                else: # Trend Surfer
-                    ret, trades = get_trend_surfer_stats(df, params['stop_loss'])
+                    ret, trades = get_dc_stats(df, params)
+                else: 
+                    ret, trades = get_trend_surfer_stats(df, params)
                 
                 entry = {
                     "Symbol": ticker.replace('.NS', ''), "Total Return": f"{ret}%",
@@ -320,7 +359,7 @@ def run_bulk_test(strategy_type, target_list, params):
     loss.sort(key=lambda x: x['Raw_Ret'])
     return prof, loss
 
-def deep_dive_chart(ticker, strategy_type, params):
+def deep_dive_chart(ticker, strategy_type, params, nifty_roc):
     try:
         search_t = ticker
         rev_map = {k.split()[0].upper(): v for k, v in COMMODITIES.items()}
@@ -329,7 +368,8 @@ def deep_dive_chart(ticker, strategy_type, params):
         
         df = yf.download(search_t, period="2y", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        df = calculate_indicators(df)
+        
+        df = calculate_indicators(df, nifty_roc)
         curr = df.iloc[-1]
         
         res = {
@@ -338,56 +378,56 @@ def deep_dive_chart(ticker, strategy_type, params):
         }
 
         if strategy_type == "Donchian Breakout":
-            ret, trades = get_dc_stats(df, params['use_vol'], params['vol_mult'])
-            
+            ret, trades = get_dc_stats(df, params)
             is_bullish = curr['Close'] > curr['Middle']
             if is_bullish:
                 res["status"] = "BULLISH (Above Mid Band)"
                 res["box_color"] = "buy-signal"
             
-            res.update({"ret": ret, "trades": trades, "info": f"Vol Spike: {round(curr['Volume']/curr['Vol_SMA_7'], 1)}x" if curr['Vol_SMA_7'] > 0 else "N/A"})
-            
         else: # Trend Surfer
-            ret, trades = get_trend_surfer_stats(df, params['stop_loss'])
-            
+            ret, trades = get_trend_surfer_stats(df, params)
             is_uptrend = (curr['Close'] > curr['EMA_20']) and (curr['Close'] > curr['EMA_50'])
             if is_uptrend:
-                res["status"] = "RIDING TREND (Price > EMA 20 & 50)"
+                res["status"] = "RIDING TREND"
                 res["box_color"] = "buy-signal"
-            else:
-                res["status"] = "NO SIGNAL / EXIT"
-                
-            res.update({"ret": ret, "trades": trades, "info": f"EMA 20: {round(curr['EMA_20'], 1)}"})
+
+        # Add RS Info
+        rs_text = "✅ Stronger than Nifty" if curr['RS_Pass'] else "❌ Weaker than Nifty"
+        res.update({"ret": ret, "trades": trades, "info": f"{rs_text}"})
 
         return res
     except: return None
 
 # --- 6. UI LAYOUT ---
 
-# SIDEBAR: Strategy Selector
+# SIDEBAR
 with st.sidebar:
     st.header("🎮 Strategy Control")
-    strat_mode = st.radio("Select Engine", ["Donchian Breakout", "Trend Surfer"], 
-                          help="Donchian: Breakout (Bull Market) | Trend Surfer: EMA Trend + Stop Loss")
+    strat_mode = st.radio("Select Engine", ["Donchian Breakout", "Trend Surfer"])
     
-    params = {}
     st.divider()
+    
+    # GLOBAL FILTER: Relative Strength
+    use_rs = st.checkbox("✅ Enable RS Filter", value=True, help="Only buy if Stock > Nifty (55 Days)")
+    
+    params = {'use_rs': use_rs}
     
     if strat_mode == "Donchian Breakout":
         st.subheader("🌊 Breakout Settings")
         params['trend'] = st.checkbox("Trend Filter (>200 SMA)", True)
         params['rsi'] = st.checkbox("RSI Filter (<70)", True)
-        st.divider()
         params['use_vol'] = st.checkbox("Volume Spike Filter", True)
         params['vol_mult'] = st.slider("Min Vol Spike (x)", 1.5, 5.0, 2.5)
         params['min_liq'] = 10000
-        st.info("Strategy: Buy Breakouts of 20-Day High")
         
     else: # Trend Surfer
         st.subheader("🏄 Trend Surfer Settings")
-        st.caption("Strategy: EMA Crossover + Hard Stop Loss")
-        params['stop_loss'] = st.slider("Stop Loss %", 3.0, 15.0, 7.0, 0.5, help="Exits if price drops X% from entry")
-        st.info("Entry: Close > EMA 20 & 50\nExit: Close < EMA 20\nSafety: Stop Loss Active")
+        st.caption("Entry: Close > EMA 20 & 50")
+        params['stop_loss'] = st.slider("Stop Loss %", 3.0, 15.0, 7.0, 0.5)
+
+# FETCH SHARED DATA
+with st.spinner("Initializing Market Data..."):
+    nifty_roc = fetch_nifty_data()
 
 # MAIN PAGE
 with st.expander("🚀 Scanner Controls", expanded=True):
@@ -402,58 +442,56 @@ tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "🔍 Deep Dive", "📊 Bulk Ba
 with tab1:
     if run_btn:
         t_list = NSE_500_LIST if market == "NSE 500" else list(COMMODITIES.values())
-        with st.spinner(f"Running {strat_mode} Engine..."):
-            results = run_master_scan(strat_mode, t_list, params)
+        with st.spinner(f"Running {strat_mode} Engine (RS={use_rs})..."):
+            results = run_master_scan(strat_mode, t_list, params, nifty_roc)
             st.session_state['scan_res'] = results
             
     if 'scan_res' in st.session_state:
         df_res = pd.DataFrame(st.session_state['scan_res'])
         if not df_res.empty:
             st.success(f"✅ FOUND {len(df_res)} SIGNALS")
-            st.caption("Sorted by 2-Year Historical Return")
-            
-            event = st.dataframe(
-                df_res, hide_index=True, use_container_width=True,
-                on_select="rerun", selection_mode="single-row"
-            )
-            if event.selection.rows:
-                sel_ticker = df_res.iloc[event.selection.rows[0]]['Symbol']
-                st.session_state['dd_ticker'] = sel_ticker
-                st.info(f"Selected {sel_ticker} for Deep Dive.")
+            st.dataframe(df_res, hide_index=True, use_container_width=True)
         else:
             st.warning("No stocks matched criteria today.")
 
 with tab2:
     st.header("Deep Dive Analysis")
-    default = st.session_state.get('dd_ticker', '')
-    user_in = st.text_input("Symbol", value=default).upper().strip()
-    
+    user_in = st.text_input("Symbol (e.g., RELIANCE)").upper().strip()
     if st.button("Analyze Stock") or user_in:
         if user_in:
-            data = deep_dive_chart(user_in, strat_mode, params)
+            data = deep_dive_chart(user_in, strat_mode, params, nifty_roc)
             if data:
                 st.markdown(f"""
                     <div class="metric-box {data['box_color']}">
                         <h2>{data['name']}</h2>
                         <h3>CMP: {data['cmp']} | {data['status']}</h3>
-                        <p>{data['info']} | <b>Trades (2Y):</b> {data['trades']} | <b>Total Ret (2Y):</b> {data['ret']}%</p>
+                        <p>{data['info']} | <b>Trades:</b> {data['trades']} | <b>Ret (2Y):</b> {data['ret']}%</p>
                     </div>
                 """, unsafe_allow_html=True)
             else: st.error("Not found.")
 
 with tab3:
     st.header(f"📊 {strat_mode}: Historical Performance")
-    st.write("Tests strategy on ALL stocks over last 2 years.")
+    
+    # NOISE FILTER UI
+    col_filt1, col_filt2 = st.columns([1, 2])
+    with col_filt1:
+        min_profit = st.number_input("Min Profit % (Noise Filter)", 0, 100, 5)
     
     if st.button("RUN BULK BACKTEST", type="primary"):
         t_list = NSE_500_LIST if market == "NSE 500" else list(COMMODITIES.values())
         with st.spinner("Crunching Numbers..."):
-            prof, loss = run_bulk_test(strat_mode, t_list, params)
+            prof, loss = run_bulk_test(strat_mode, t_list, params, nifty_roc)
+            
+            # Apply Noise Filter
+            prof_clean = [p for p in prof if p['Raw_Ret'] >= min_profit]
+            noise_removed = len(prof) - len(prof_clean)
             
             c1, c2 = st.columns(2)
             with c1:
-                st.success(f"🏆 Profitable: {len(prof)}")
-                if prof: st.dataframe(pd.DataFrame(prof).drop(columns=['Raw_Ret']), hide_index=True)
+                st.success(f"🏆 Profitable: {len(prof_clean)} (Filtered)")
+                if noise_removed > 0: st.caption(f"Hidden {noise_removed} stocks < {min_profit}% return")
+                if prof_clean: st.dataframe(pd.DataFrame(prof_clean).drop(columns=['Raw_Ret']), hide_index=True)
             with c2:
                 st.error(f"⚠️ Loss Making: {len(loss)}")
                 if loss: st.dataframe(pd.DataFrame(loss).drop(columns=['Raw_Ret']), hide_index=True)
