@@ -5,48 +5,34 @@ import numpy as np
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(
-    page_title="DC Pro - Volume Enhanced", 
+    page_title="ProTrader - Twin Engine", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
 
-# CSS: Professional UI & Mobile Optimizations
+# CSS: Professional UI
 st.markdown("""
     <style>
         #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
         header {visibility: hidden;}
-        .stDeployButton {display:none;}
-        
-        /* Button Styling */
         div.stButton > button { 
-            background-color: #00C853; 
-            color: white; 
-            font-weight: bold; 
-            border: none; 
-            width: 100%; 
+            background-color: #00C853; color: white; font-weight: bold; border: none; width: 100%; 
         }
-        
-        /* Metric Box Styling */
         .metric-box { 
-            padding: 15px; 
-            border-radius: 8px; 
-            text-align: center; 
-            margin-bottom: 10px; 
-            border: 1px solid #ddd; 
+            padding: 15px; border-radius: 8px; text-align: center; margin-bottom: 10px; border: 1px solid #ddd; 
         }
         .buy-signal { background-color: #d4edda; color: #155724; border-color: #c3e6cb; }
-        .sell-signal { background-color: #f8d7da; color: #721c24; border-color: #f5c6cb; }
         .neutral { background-color: #f8f9fa; color: #666; }
     </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ DC Strategy: Volume Enhanced")
+st.title("⚡ ProTrader: Twin-Engine System")
 
 # --- 2. ASSET LISTS ---
 COMMODITIES = {
     'Gold (Global)': 'GC=F', 'Silver (Global)': 'SI=F', 'Copper (Global)': 'HG=F',
-    'Crude Oil': 'CL=F', 'Natural Gas': 'NG=F', 'Aluminum': 'ALI=F'
+    'Crude Oil': 'CL=F', 'Natural Gas': 'NG=F'
 }
 
 NSE_500_LIST = [
@@ -103,95 +89,105 @@ NSE_500_LIST = [
     'KAYNES.NS'
 ]
 
-# --- 3. ANALYTICS ENGINE ---
+# --- 3. CORE ANALYTICS ENGINE (Shared) ---
 def calculate_indicators(df):
     """
-    Calculates Donchian (20), SMA (200), RSI (14)
-    AND Volume Stats: 7-Day Average Volume (Shifted 1)
+    Calculates ALL indicators needed for BOTH strategies in one pass.
     """
-    # 1. Donchian Channels
+    # 1. Donchian (For Strategy 1)
     df['High_20'] = df['High'].rolling(20).max()
     df['Low_20'] = df['Low'].rolling(20).min()
     df['Middle'] = (df['High_20'] + df['Low_20']) / 2
     
-    # 2. Trend & Momentum
+    # 2. Trend & MA (Shared)
     df['SMA_200'] = df['Close'].rolling(200).mean()
+    df['SMA_5'] = df['Close'].rolling(5).mean() # For Mean Reversion Exit
     
-    # 3. RSI Calculation
+    # 3. RSI 14 (For Strategy 1)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # 4. Volume Metrics (NEW)
-    # We use shift(1) to get the average of the PREVIOUS 7 days, excluding today
+    # 4. RSI 2 (For Strategy 2 - Mean Reversion)
+    gain_2 = (delta.where(delta > 0, 0)).rolling(2).mean()
+    loss_2 = (-delta.where(delta < 0, 0)).rolling(2).mean()
+    rs_2 = gain_2 / loss_2
+    df['RSI_2'] = 100 - (100 / (1 + rs_2))
+    
+    # 5. Volume Stats (For Strategy 1)
     df['Vol_SMA_7'] = df['Volume'].rolling(7).mean().shift(1)
     
     return df
 
-def get_strategy_stats(df, use_vol=False, vol_multiplier=2.5, min_liquidity=0):
-    """
-    STRICT BACKTEST ENGINE
-    Returns: Total Return % (float), Trade Count (int)
-    """
-    # Define Conditions
+# --- 4. BACKTEST ENGINES (Strategy Specific) ---
+
+def get_dc_stats(df, use_vol=False, vol_multiplier=2.5, min_liquidity=0):
+    """STRATEGY 1: Donchian Breakout Backtest"""
     prev_close = df['Close'].shift(1)
     prev_mid = df['Middle'].shift(1)
     
-    # 1. Basic Signals (Crossover)
-    # Crossover UP (Buy Candidate)
+    # Entry: Cross Up
     cross_up = (df['Close'] > df['Middle']) & (prev_close < prev_mid)
-    # Crossover DOWN (Sell/Exit Signal)
+    # Exit: Cross Down
     cross_down = (df['Close'] < df['Middle']) & (prev_close > prev_mid)
     
-    # 2. Apply Filters to ENTRY only
     entry_signal = cross_up.copy()
-    
     if use_vol:
-        # Volume Spike Condition: Vol > Multiplier * Avg AND Vol_Avg > Min_Liquidity
         vol_cond = (df['Volume'] > vol_multiplier * df['Vol_SMA_7']) & (df['Vol_SMA_7'] > min_liquidity)
-        # Strict Entry: Must trigger Crossover AND Volume Spike together
         entry_signal = entry_signal & vol_cond
 
-    # 3. Vectorized State Machine (Latch Logic)
-    # Create an 'actions' series: 1 = Enter, 0 = Exit, NaN = Hold Status Quo
     actions = pd.Series(np.nan, index=df.index)
-    actions.loc[entry_signal] = 1 # Enter on Valid Signal
-    actions.loc[cross_down] = 0   # Exit on ANY Cross Down
+    actions.loc[entry_signal] = 1 
+    actions.loc[cross_down] = 0   
     
-    # Forward fill to simulate "Holding" the position
-    # If Action is NaN, it takes previous day's state (Hold or Flat)
-    df['Signal_Strat'] = actions.ffill().fillna(0)
+    df['Signal'] = actions.ffill().fillna(0).shift(1)
     
-    # 4. Calculate Returns (Enter Next Day)
-    df['Signal_Strat'] = df['Signal_Strat'].shift(1) 
-    
-    df['Daily_Ret'] = df['Close'].pct_change()
-    df['Strat_Ret'] = df['Daily_Ret'] * df['Signal_Strat']
-    
-    # 5. Cumulative Metrics
+    df['Strat_Ret'] = df['Close'].pct_change() * df['Signal']
     cum_ret = (1 + df['Strat_Ret']).cumprod().iloc[-1] - 1
-    total_ret_pct = round(cum_ret * 100, 2)
+    trades = df['Signal'].diff().abs().sum() / 2
     
-    # Count Trades (Transitions from 0 to 1)
-    trades = df['Signal_Strat'].diff().abs().sum() / 2
+    return round(cum_ret * 100, 2), int(trades)
+
+def get_mr_stats(df, rsi_entry=10):
+    """STRATEGY 2: Mean Reversion (Dip Snap) Backtest"""
+    # Logic: 
+    # Buy IF: Close > SMA 200 (Uptrend) AND RSI_2 < Threshold (Panic)
+    # Sell IF: Close > SMA 5 (Snap back)
     
-    return total_ret_pct, int(trades)
+    # 1. Define Conditions
+    is_uptrend = df['Close'] > df['SMA_200']
+    is_panic = df['RSI_2'] < rsi_entry
+    
+    entry_signal = is_uptrend & is_panic
+    exit_signal = df['Close'] > df['SMA_5']
+    
+    # 2. Vectorized Latch (State Machine)
+    actions = pd.Series(np.nan, index=df.index)
+    actions.loc[entry_signal] = 1 # Enter
+    actions.loc[exit_signal] = 0  # Exit
+    
+    # Fill NaN: If no signal today, keep previous state (Hold or Flat)
+    df['Signal'] = actions.ffill().fillna(0).shift(1) # Enter next day
+    
+    # 3. Calc Returns
+    df['Strat_Ret'] = df['Close'].pct_change() * df['Signal']
+    cum_ret = (1 + df['Strat_Ret']).cumprod().iloc[-1] - 1
+    trades = df['Signal'].diff().abs().sum() / 2
+    
+    return round(cum_ret * 100, 2), int(trades)
 
 def process_batch(tickers, period="2y"):
-    """Downloads batch with AUTO-ADJUST"""
     try:
         data = yf.download(tickers, period=period, group_by='ticker', threads=True, progress=False, auto_adjust=True)
         return data
-    except Exception:
-        return None
+    except: return None
 
-# --- 4. SCANNER LOGIC ---
+# --- 5. MASTER SCANNER ---
 @st.cache_data(ttl=900)
-def run_scan(target_list, use_trend, use_rsi, use_vol, vol_multiplier, min_liquidity=10000):
-    results_buy = []
-    results_sell = []
+def run_master_scan(strategy_type, target_list, params):
+    results = []
     
     chunk_size = 30
     total_chunks = range(0, len(target_list), chunk_size)
@@ -200,7 +196,7 @@ def run_scan(target_list, use_trend, use_rsi, use_vol, vol_multiplier, min_liqui
     
     for i, start_idx in enumerate(total_chunks):
         batch = target_list[start_idx : start_idx + chunk_size]
-        status.caption(f"Scanning & Backtesting batch {i+1}/{len(total_chunks)}...")
+        status.caption(f"Scanning batch {i+1}/{len(total_chunks)}...")
         
         data = process_batch(batch, period="2y")
         if data is None or data.empty: continue
@@ -210,91 +206,75 @@ def run_scan(target_list, use_trend, use_rsi, use_vol, vol_multiplier, min_liqui
                 df = data[ticker] if len(batch) > 1 else data.copy()
                 if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                 df = df.dropna()
-                if len(df) < 50: continue
+                if len(df) < 200: continue # Need 200 SMA
                 
                 df = calculate_indicators(df)
                 today = df.iloc[-1]
                 prev = df.iloc[-2]
-                
                 display_name = ticker.replace('.NS', '').replace('=F', '')
                 
-                # --- LIVE SCANNER CONDITIONS ---
-                # Check for Valid Buy Signal TODAY
+                # --- STRATEGY BRANCHING ---
                 
-                # 1. Price Crossover
-                is_crossover = (prev['Close'] < prev['Middle']) and (today['Close'] > today['Middle'])
-                
-                if is_crossover:
-                    # 2. Trend Filter
-                    if use_trend and today['Close'] < today['SMA_200']: continue
+                if strategy_type == "Donchian Breakout":
+                    # Check Live Entry
+                    is_cross = (prev['Close'] < prev['Middle']) and (today['Close'] > today['Middle'])
+                    if is_cross:
+                        # Filters
+                        if params['trend'] and today['Close'] < today['SMA_200']: continue
+                        if params['rsi'] and today['RSI'] > 70: continue
+                        
+                        vol_spike = 0.0
+                        if today['Vol_SMA_7'] > 0: vol_spike = today['Volume'] / today['Vol_SMA_7']
+                        
+                        if params['use_vol']:
+                            if today['Vol_SMA_7'] < params['min_liq']: continue
+                            if vol_spike < params['vol_mult']: continue
+                        
+                        # Backtest
+                        ret, trades = get_dc_stats(df, params['use_vol'], params['vol_mult'], params['min_liq'])
+                        
+                        results.append({
+                            "Symbol": display_name, "Price": round(today['Close'], 2),
+                            "Signal": "Breakout", "Vol Spike": f"{round(vol_spike, 1)}x",
+                            "Trades (2Y)": trades, "Ret (2Y)": f"{ret}%", "raw_ret": ret
+                        })
+
+                elif strategy_type == "Mean Reversion":
+                    # Check Live Entry: Uptrend + Panic RSI
+                    is_uptrend = today['Close'] > today['SMA_200']
+                    is_panic = today['RSI_2'] < params['rsi_entry']
                     
-                    # 3. RSI Filter
-                    if use_rsi and today['RSI'] > 70: continue
-                    
-                    # 4. Volume Filter (Strict)
-                    vol_spike = 0.0
-                    if today['Vol_SMA_7'] > 0:
-                        vol_spike = today['Volume'] / today['Vol_SMA_7']
-                    
-                    if use_vol:
-                        if today['Vol_SMA_7'] < min_liquidity: continue
-                        if vol_spike < vol_multiplier: continue
-                    
-                    # --- STRICT BACKTEST ---
-                    # Pass the exact volume settings to the backtest engine
-                    ret_2y, trades_2y = get_strategy_stats(df, use_vol, vol_multiplier, min_liquidity)
-                    
-                    results_buy.append({
-                        "Symbol": display_name,
-                        "Price": round(today['Close'], 2),
-                        "RSI": round(today['RSI'], 1),
-                        "Vol Spike": f"{round(vol_spike, 1)}x", 
-                        "Trend": "⬆️ Uptrend" if today['Close'] > today['SMA_200'] else "⬇️ Weak",
-                        "raw_ret": ret_2y, 
-                        "Trades (2Y)": trades_2y,
-                        "Total Ret (2Y Strict)": f"{ret_2y}%"
-                    })
-                
-                # SELL Signal (Standard)
-                elif prev['Close'] > prev['Middle'] and today['Close'] < today['Middle']:
-                    results_sell.append({
-                        "Symbol": display_name,
-                        "Price": round(today['Close'], 2),
-                        "Signal Date": today.name.strftime('%Y-%m-%d')
-                    })
-                    
+                    if is_uptrend and is_panic:
+                        # Backtest
+                        ret, trades = get_mr_stats(df, params['rsi_entry'])
+                        
+                        results.append({
+                            "Symbol": display_name, "Price": round(today['Close'], 2),
+                            "Signal": "Dip Buy", "RSI(2)": round(today['RSI_2'], 1),
+                            "Trades (2Y)": trades, "Ret (2Y)": f"{ret}%", "raw_ret": ret
+                        })
+                        
             except: continue
-            
         progress.progress((i + 1) / len(total_chunks))
     
-    if results_buy:
-        results_buy.sort(key=lambda x: x['raw_ret'], reverse=True)
-        for item in results_buy:
-            del item['raw_ret']
-
+    if results:
+        results.sort(key=lambda x: x['raw_ret'], reverse=True)
+        for item in results: del item['raw_ret']
+        
     progress.empty()
     status.empty()
-    return results_buy, results_sell
+    return results
 
-# --- 5. BACKTEST LOGIC (Bulk) ---
 @st.cache_data(ttl=3600)
-def run_bulk_backtest(target_list, use_vol, vol_multiplier, min_liquidity=10000):
-    """
-    Scans 2 years of history for ALL stocks using STRICT USER SETTINGS.
-    """
-    profitable = []
-    loss_making = []
-    
+def run_bulk_test(strategy_type, target_list, params):
+    prof, loss = [], []
     chunk_size = 50
-    total_chunks = range(0, len(target_list), chunk_size)
+    chunks = range(0, len(target_list), chunk_size)
     progress = st.progress(0)
-    status = st.empty()
     
-    for i, start_idx in enumerate(total_chunks):
-        batch = target_list[start_idx : start_idx + chunk_size]
-        status.caption(f"Backtesting batch {i+1}/{len(total_chunks)}...")
-        
-        data = process_batch(batch, period="2y")
+    for i, start in enumerate(chunks):
+        batch = target_list[start : start + chunk_size]
+        data = process_batch(batch)
         if data is None or data.empty: continue
         
         for ticker in batch:
@@ -303,38 +283,29 @@ def run_bulk_backtest(target_list, use_vol, vol_multiplier, min_liquidity=10000)
                 if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                 df = df.dropna()
                 if len(df) < 200: continue
-                
                 df = calculate_indicators(df)
                 
-                # Pass User Settings to Backtest
-                total_ret_pct, trades = get_strategy_stats(df, use_vol, vol_multiplier, min_liquidity)
+                if strategy_type == "Donchian Breakout":
+                    ret, trades = get_dc_stats(df, params['use_vol'], params['vol_mult'], params['min_liq'])
+                else:
+                    ret, trades = get_mr_stats(df, params['rsi_entry'])
                 
                 entry = {
-                    "Symbol": ticker.replace('.NS', '').replace('=F', ''),
-                    "Total Return": f"{total_ret_pct}%",
-                    "Trades": trades,
-                    "Raw_Ret": total_ret_pct
+                    "Symbol": ticker.replace('.NS', ''), "Total Return": f"{ret}%",
+                    "Trades": trades, "Raw_Ret": ret
                 }
                 
-                if total_ret_pct > 0:
-                    profitable.append(entry)
-                else:
-                    loss_making.append(entry)
-                    
+                if ret > 0: prof.append(entry)
+                else: loss.append(entry)
             except: continue
+        progress.progress((i+1)/len(chunks))
         
-        progress.progress((i + 1) / len(total_chunks))
-    
     progress.empty()
-    status.empty()
-    
-    profitable.sort(key=lambda x: x['Raw_Ret'], reverse=True)
-    loss_making.sort(key=lambda x: x['Raw_Ret']) 
-    
-    return profitable, loss_making
+    prof.sort(key=lambda x: x['Raw_Ret'], reverse=True)
+    loss.sort(key=lambda x: x['Raw_Ret'])
+    return prof, loss
 
-def deep_dive(ticker, use_vol, vol_multiplier):
-    """Historical Check with Chart Data"""
+def deep_dive_chart(ticker, strategy_type, params):
     try:
         search_t = ticker
         rev_map = {k.split()[0].upper(): v for k, v in COMMODITIES.items()}
@@ -343,174 +314,138 @@ def deep_dive(ticker, use_vol, vol_multiplier):
         
         df = yf.download(search_t, period="2y", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        
         df = calculate_indicators(df)
         curr = df.iloc[-1]
         
-        # Strict Backtest for display
-        ret_2y, trades_2y = get_strategy_stats(df, use_vol, vol_multiplier)
-        
-        is_bullish = curr['Close'] > curr['Middle']
-        
-        vol_spike = 0.0
-        if curr['Vol_SMA_7'] > 0:
-            vol_spike = round(curr['Volume'] / curr['Vol_SMA_7'], 2)
-        
-        if is_bullish:
-             status = "BULLISH (Active Buy Signal)"
-             box_color = "buy-signal"
-        else:
-             status = "No Trade Alerts"
-             box_color = "neutral"
-        
-        # Logic to find last signals (Simplified for display)
-        # Note: This finds simple crossovers, not strict volume entries for the dates
-        df['Buy_X'] = (df['Close'] > df['Middle']) & (df['Close'].shift(1) < df['Middle'].shift(1))
-        df['Sell_X'] = (df['Close'] < df['Middle']) & (df['Close'].shift(1) > df['Middle'].shift(1))
-        
-        last_buy = df[df['Buy_X']].tail(1)
-        last_sell = df[df['Sell_X']].tail(1)
-        
         res = {
-            "name": ticker.replace('.NS', ''),
-            "cmp": round(curr['Close'], 2),
-            "status": status,
-            "box_color": box_color,
-            "is_bullish": is_bullish,
-            "buy_date": "-", "buy_price": 0, "pnl": 0.0,
-            "sell_date": "-", "sell_price": 0,
-            "ret_2y": ret_2y,
-            "trades_2y": trades_2y,
-            "curr_vol_spike": f"{vol_spike}x"
+            "name": ticker.replace('.NS', ''), "cmp": round(curr['Close'], 2),
+            "status": "Neutral", "box_color": "neutral"
         }
-        
-        if not last_buy.empty:
-            res['buy_date'] = last_buy.index[-1].strftime('%d-%b-%Y')
-            res['buy_price'] = round(last_buy['Close'].values[-1], 2)
-            if is_bullish:
-                res['pnl'] = round(((curr['Close'] - res['buy_price']) / res['buy_price']) * 100, 2)
-                
-        if not last_sell.empty:
-            res['sell_date'] = last_sell.index[-1].strftime('%d-%b-%Y')
-            res['sell_price'] = round(last_sell['Close'].values[-1], 2)
+
+        if strategy_type == "Donchian Breakout":
+            ret, trades = get_dc_stats(df, params['use_vol'], params['vol_mult'])
             
-        return res, df
-    except: return None, None
+            # Live Status Logic
+            is_bullish = curr['Close'] > curr['Middle']
+            if is_bullish:
+                res["status"] = "BULLISH (Above Mid Band)"
+                res["box_color"] = "buy-signal"
+            
+            res.update({"ret": ret, "trades": trades, "info": f"Vol Spike: {round(curr['Volume']/curr['Vol_SMA_7'], 1)}x" if curr['Vol_SMA_7'] > 0 else "N/A"})
+            
+        else: # Mean Reversion
+            ret, trades = get_mr_stats(df, params['rsi_entry'])
+            
+            # Live Status Logic
+            in_trade = (curr['Close'] > curr['SMA_200']) and (curr['Close'] < curr['SMA_5']) # Holding
+            can_buy = (curr['Close'] > curr['SMA_200']) and (curr['RSI_2'] < params['rsi_entry'])
+            
+            if can_buy:
+                res["status"] = "BUY SIGNAL (Panic Dip)"
+                res["box_color"] = "buy-signal"
+            elif in_trade:
+                res["status"] = "HOLD (Waiting for Snap)"
+                res["box_color"] = "neutral"
+            else:
+                res["status"] = "NO SIGNAL"
+                
+            res.update({"ret": ret, "trades": trades, "info": f"RSI(2): {round(curr['RSI_2'], 1)}"})
+
+        return res
+    except: return None
 
 # --- 6. UI LAYOUT ---
-# Mobile Optimization: Controls moved to Main Page Expander
-with st.expander("⚙️ Scanner Settings & Controls", expanded=True):
-    # Top Row: Market Selection & Run
-    c_top1, c_top2 = st.columns([2,1])
-    with c_top1:
-        market = st.radio("Select Market", ["NSE 500 (Full)", "Commodities"], horizontal=True)
-    with c_top2:
-        run_btn = st.button("🚀 RUN SCANNER", type="primary")
 
-    st.markdown("---")
+# SIDEBAR: Strategy Selector
+with st.sidebar:
+    st.header("🎮 Strategy Control")
+    strat_mode = st.radio("Select Engine", ["Donchian Breakout", "Mean Reversion"], 
+                          help="Donchian: Trend Following | Mean Reversion: Dip Buying")
     
-    # Bottom Row: Filters (3 Columns)
-    f1, f2, f3 = st.columns(3)
+    params = {}
+    st.divider()
     
-    with f1:
-        st.write("#### 1. Trend & Momentum")
-        trend_filter = st.checkbox("✅ Trend Filter (>200 SMA)", True)
-        rsi_filter = st.checkbox("✅ RSI Filter (<70)", True)
+    if strat_mode == "Donchian Breakout":
+        st.subheader("🌊 Breakout Settings")
+        params['trend'] = st.checkbox("Trend Filter (>200 SMA)", True)
+        params['rsi'] = st.checkbox("RSI Filter (<70)", True)
+        st.divider()
+        params['use_vol'] = st.checkbox("Volume Spike Filter", True)
+        params['vol_mult'] = st.slider("Min Vol Spike (x)", 1.5, 5.0, 2.5)
+        params['min_liq'] = 10000
+        st.info("Best for: Strong Bull Markets")
         
-    with f2:
-        st.write("#### 2. Volume Expansion (New)")
-        use_vol = st.checkbox("✅ Enable Volume Filter", True)
-        vol_multiplier = st.slider("Min Volume Spike (x)", 1.5, 5.0, 2.5, 0.1, help="Current Vol vs 7-Day Avg")
-        
-    with f3:
-        st.info(f"**Filter Logic:**\n\nBuy IF:\n1. Price Crosses > Middle Band\n2. Vol > {vol_multiplier}x Avg (7 Days)\n3. Price > 200 SMA (Optional)")
+    else: # Mean Reversion
+        st.subheader("🧲 Mean Reversion Settings")
+        st.caption("Strategy: Buy Uptrend Dips, Sell Snaps")
+        params['rsi_entry'] = st.slider("Entry: RSI(2) Below", 2, 25, 10, help="Lower = More Extreme Panic")
+        st.info("Best for: Choppy/Volatile Markets")
 
-tab1, tab2, tab3 = st.tabs(["🚀 Market Scanner", "🔍 Deep Dive", "📊 Bulk Backtest"])
+# MAIN PAGE
+with st.expander("🚀 Scanner Controls", expanded=True):
+    c1, c2 = st.columns([2,1])
+    with c1:
+        market = st.radio("Market", ["NSE 500", "Commodities"], horizontal=True)
+    with c2:
+        run_btn = st.button("RUN SCANNER")
+
+tab1, tab2, tab3 = st.tabs(["📡 Live Scanner", "🔍 Deep Dive", "📊 Bulk Backtest"])
 
 with tab1:
     if run_btn:
-        t_list = NSE_500_LIST if market == "NSE 500 (Full)" else list(COMMODITIES.values())
-        with st.spinner(f"Scanning with Volume Filter (> {vol_multiplier}x)..."):
-            # Pass all filters to scanner
-            buys, sells = run_scan(t_list, trend_filter, rsi_filter, use_vol, vol_multiplier)
-            st.session_state['buys'] = buys
-            st.session_state['sells'] = sells
-        
-    if 'buys' in st.session_state:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.success(f"✅ BUY SIGNALS ({len(st.session_state['buys'])})")
-            if st.session_state['buys']:
-                df_b = pd.DataFrame(st.session_state['buys'])
-                
-                st.caption("👇 Select a row below to analyze in Deep Dive")
-                event = st.dataframe(
-                    df_b, 
-                    hide_index=True, 
-                    use_container_width=True,
-                    on_select="rerun", 
-                    selection_mode="single-row"
-                )
-                
-                if event.selection.rows:
-                    idx = event.selection.rows[0]
-                    selected_ticker = df_b.iloc[idx]['Symbol']
-                    st.session_state['analyze_ticker'] = selected_ticker
-                    st.info(f"👉 Selected **{selected_ticker}** for Deep Dive. Go to 'Deep Dive' tab.")
-
-        with c2:
-            st.error(f"❌ SELL SIGNALS ({len(st.session_state['sells'])})")
-            if st.session_state['sells']:
-                st.dataframe(pd.DataFrame(st.session_state['sells']), hide_index=True, use_container_width=True)
+        t_list = NSE_500_LIST if market == "NSE 500" else list(COMMODITIES.values())
+        with st.spinner(f"Running {strat_mode} Engine..."):
+            results = run_master_scan(strat_mode, t_list, params)
+            st.session_state['scan_res'] = results
+            
+    if 'scan_res' in st.session_state:
+        df_res = pd.DataFrame(st.session_state['scan_res'])
+        if not df_res.empty:
+            st.success(f"✅ FOUND {len(df_res)} SIGNALS")
+            st.caption("Sorted by 2-Year Historical Return")
+            
+            event = st.dataframe(
+                df_res, hide_index=True, use_container_width=True,
+                on_select="rerun", selection_mode="single-row"
+            )
+            if event.selection.rows:
+                sel_ticker = df_res.iloc[event.selection.rows[0]]['Symbol']
+                st.session_state['dd_ticker'] = sel_ticker
+                st.info(f"Selected {sel_ticker} for Deep Dive.")
+        else:
+            st.warning("No stocks matched criteria today.")
 
 with tab2:
     st.header("Deep Dive Analysis")
-    default = st.session_state.get('analyze_ticker', '')
-    user_in = st.text_input("Enter Symbol (e.g. RELIANCE)", value=default).upper().strip()
+    default = st.session_state.get('dd_ticker', '')
+    user_in = st.text_input("Symbol", value=default).upper().strip()
     
-    if st.button("ANALYZE") or user_in:
+    if st.button("Analyze Stock") or user_in:
         if user_in:
-            # Pass vol settings to deep dive
-            data, chart = deep_dive(user_in, use_vol, vol_multiplier)
+            data = deep_dive_chart(user_in, strat_mode, params)
             if data:
                 st.markdown(f"""
                     <div class="metric-box {data['box_color']}">
                         <h2>{data['name']}</h2>
                         <h3>CMP: {data['cmp']} | {data['status']}</h3>
-                        <p><b>Vol Spike:</b> {data['curr_vol_spike']} | <b>Trades (2Y):</b> {data['trades_2y']} | <b>Total Ret (2Y Strict):</b> {data['ret_2y']}%</p>
+                        <p>{data['info']} | <b>Trades (2Y):</b> {data['trades']} | <b>Total Ret (2Y):</b> {data['ret']}%</p>
                     </div>
                 """, unsafe_allow_html=True)
-                
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Last Buy Signal", f"{data['buy_date']}", f"@{data['buy_price']}")
-                m2.metric("Last Sell Signal", f"{data['sell_date']}", f"@{data['sell_price']}")
-                m3.metric("Current P&L", f"{data['pnl']}%")
-                
-            else: st.error("Stock not found.")
+            else: st.error("Not found.")
 
 with tab3:
-    st.header("📊 Strategy Performance (2 Years)")
-    st.write("Bulk scan of all 500 stocks to find historical winners.")
-    
-    backtest_market = st.radio("Select Market for Backtest", ["NSE 500 (Full)", "Commodities"], key="bt_market")
-    
-    st.info(f"ℹ️ This backtest will use the **Volume Filter (> {vol_multiplier}x)** enabled in settings.")
+    st.header(f"📊 {strat_mode}: Historical Performance")
+    st.write("Tests strategy on ALL stocks over last 2 years.")
     
     if st.button("RUN BULK BACKTEST", type="primary"):
-        t_list = NSE_500_LIST if backtest_market == "NSE 500 (Full)" else list(COMMODITIES.values())
-        
-        with st.spinner("Crunching 2 years of data... (60-90s)"):
-            # Pass user settings to bulk backtest
-            prof, loss = run_bulk_backtest(t_list, use_vol, vol_multiplier)
+        t_list = NSE_500_LIST if market == "NSE 500" else list(COMMODITIES.values())
+        with st.spinner("Crunching Numbers..."):
+            prof, loss = run_bulk_test(strat_mode, t_list, params)
             
-            col_a, col_b = st.columns(2)
-            
-            with col_a:
-                st.success(f"🏆 Profitable Stocks ({len(prof)})")
-                if prof:
-                    st.dataframe(pd.DataFrame(prof).drop(columns=['Raw_Ret']), use_container_width=True, hide_index=True)
-            
-            with col_b:
-                st.error(f"⚠️ Loss Making Stocks ({len(loss)})")
-                if loss:
-                    st.dataframe(pd.DataFrame(loss).drop(columns=['Raw_Ret']), use_container_width=True, hide_index=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.success(f"🏆 Profitable: {len(prof)}")
+                if prof: st.dataframe(pd.DataFrame(prof).drop(columns=['Raw_Ret']), hide_index=True)
+            with c2:
+                st.error(f"⚠️ Loss Making: {len(loss)}")
+                if loss: st.dataframe(pd.DataFrame(loss).drop(columns=['Raw_Ret']), hide_index=True)
